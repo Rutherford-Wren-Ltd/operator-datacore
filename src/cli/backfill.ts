@@ -8,9 +8,11 @@
 //   npm run backfill -- --months 6
 //   npm run backfill -- --from 2024-01-01 --to 2024-03-31
 //   npm run backfill -- --source amazon --report sales-traffic --months 24
+//   npm run backfill -- --concurrency 1 --delay 30000   # gentler on the rate limit
 //
-// SP-API rate limits are respected. A 30-day backfill across 1 marketplace
-// takes ~3-5 minutes; 24 months takes 1-2 hours.
+// SP-API rate limits: the Sales & Traffic createReport quota is low (~1/min).
+// --concurrency caps how many run at once; --delay adds a pause (ms) after each
+// day so we stay under quota. Raise --delay if you hit 429 QuotaExceeded.
 // ============================================================================
 
 import { parseArgs } from 'node:util';
@@ -26,6 +28,7 @@ interface ParsedArgs {
   from: Date | null;
   to: Date | null;
   concurrency: number;
+  delayMs: number;
 }
 
 function parseCliArgs(): ParsedArgs {
@@ -37,6 +40,7 @@ function parseCliArgs(): ParsedArgs {
       from: { type: 'string' },
       to: { type: 'string' },
       concurrency: { type: 'string', default: '3' },
+      delay: { type: 'string', default: '2000' },
     },
   });
 
@@ -44,8 +48,9 @@ function parseCliArgs(): ParsedArgs {
   const from = values.from ? new Date(values.from + 'T00:00:00Z') : null;
   const to = values.to ? new Date(values.to + 'T23:59:59Z') : null;
   const concurrency = parseInt(values.concurrency!, 10);
+  const delayMs = parseInt(values.delay!, 10);
 
-  return { source: values.source!, report: values.report!, months, from, to, concurrency };
+  return { source: values.source!, report: values.report!, months, from, to, concurrency, delayMs };
 }
 
 async function main(): Promise<void> {
@@ -83,6 +88,7 @@ async function main(): Promise<void> {
   console.log(`  Marketplaces:  ${marketplaceIds.join(', ')}`);
   console.log(`  Window:        ${fromDate.toISOString().slice(0, 10)} → ${toDate.toISOString().slice(0, 10)}`);
   console.log(`  Concurrency:   ${args.concurrency}`);
+  console.log(`  Delay:         ${args.delayMs}ms between days`);
   console.log('');
 
   const spClient = new SpApiClient({
@@ -127,6 +133,7 @@ async function main(): Promise<void> {
       fromDate,
       toDate,
       concurrency: args.concurrency,
+      delayMs: args.delayMs,
       onProgress: (info) => {
         const pct = ((info.done / info.total) * 100).toFixed(1).padStart(5);
         console.log(`  [${pct}%] ${info.day} ${info.marketplace.padEnd(15)} → ${info.rows} ASIN rows`);

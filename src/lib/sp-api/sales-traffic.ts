@@ -225,9 +225,13 @@ export async function ingestSalesTrafficDay(opts: RunSalesTrafficOptions): Promi
   return { rowsUpserted };
 }
 
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * Backfill Sales & Traffic for a window of days, across one or more marketplaces.
- * Concurrency-limited so we don't blow the createReport rate limit.
+ * Concurrency-limited so we don't blow the createReport rate limit. pLimit caps
+ * how many run at once but not the rate, so delayMs adds a pause after each task
+ * to keep us under the Sales & Traffic createReport quota (~1/min).
  */
 export async function backfillSalesTraffic(opts: {
   spClient: SpApiClient;
@@ -238,6 +242,7 @@ export async function backfillSalesTraffic(opts: {
   fromDate: Date;
   toDate: Date;
   concurrency?: number;
+  delayMs?: number;
   onProgress?: (info: { day: string; marketplace: string; rows: number; done: number; total: number }) => void;
 }): Promise<{ totalDays: number; totalRows: number }> {
   const days: Date[] = [];
@@ -280,6 +285,11 @@ export async function backfillSalesTraffic(opts: {
           done,
           total: tasks.length,
         });
+        // Throttle: pLimit caps concurrency but not rate. Pause after each task
+        // (except the last) so createReport calls stay under the quota.
+        if (done < tasks.length && (opts.delayMs ?? 0) > 0) {
+          await sleep(opts.delayMs!);
+        }
       }),
     ),
   );
