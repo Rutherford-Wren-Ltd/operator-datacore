@@ -25,26 +25,33 @@ They work independently. They're far more valuable together.
 
 ### Step 1 — Add the Supabase MCP server to Claude Code
 
-Claude Code's MCP system can talk to Supabase via the official MCP server. Add it to your `~/.claude/mcp.json` (create if it doesn't exist):
+Claude Code talks to the data lake through Supabase's official hosted MCP server. There is
+nothing to install and no key to store. You add one remote server and authenticate with your
+Supabase login:
 
-```json
-{
-  "mcpServers": {
-    "operator-datacore": {
-      "command": "npx",
-      "args": ["-y", "@supabase/mcp-server-supabase@latest"],
-      "env": {
-        "SUPABASE_URL": "https://YOUR-PROJECT.supabase.co",
-        "SUPABASE_SERVICE_ROLE_KEY": "eyJ...your-service-role-key..."
-      }
-    }
-  }
-}
+```
+claude mcp add --transport http supabase \
+  "https://mcp.supabase.com/mcp?project_ref=YOUR_PROJECT_REF&read_only=true" --scope user
 ```
 
-Use the same `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` from your `operator-datacore/.env`.
+Replace `YOUR_PROJECT_REF` with your Supabase project ref. It is the subdomain of your
+project URL and also appears in the dashboard URL. It is not a secret.
 
-Restart Claude Code.
+The two query parameters matter:
+
+- `read_only=true` runs every query as a read-only Postgres user. Keep it in the URL. It is
+  the guardrail.
+- `project_ref=...` scopes the connection to one project and disables account-level tools.
+
+Then, inside Claude Code, run `/mcp`, select the `supabase` server, and complete the browser
+login. Run `/mcp` again and it should show the server connected with a tool count.
+
+Do not configure this with `SUPABASE_SERVICE_ROLE_KEY`. The service role key bypasses every
+access control in the database. The hosted server with `read_only=true` plus your own login
+is both simpler and safer, and it keeps no secret in a config file.
+
+For a step-by-step macOS walkthrough aimed at a non-technical operator, see
+[`docs/runbooks/connect-data-lake-macos.md`](runbooks/connect-data-lake-macos.md).
 
 ### Step 2 — Tell Claude what to do with it
 
