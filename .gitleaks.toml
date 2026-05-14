@@ -1,0 +1,52 @@
+# gitleaks config for operator-datacore (RW-AI-OS fork)
+# Extends the default gitleaks ruleset with patterns the defaults miss:
+# Amazon SP-API / LWA credentials and Supabase connection strings.
+# Picked up automatically by the global pre-commit hook (gitleaks protect --staged).
+
+title = "RW-AI-OS operator-datacore gitleaks config"
+
+[extend]
+# Keep every built-in rule (AWS, GitHub, Stripe, generic JWT, etc.) and add ours.
+useDefault = true
+
+[[rules]]
+id = "amazon-sp-api-refresh-token"
+description = "Amazon SP-API LWA refresh token (Atzr| prefix)"
+regex = '''Atzr\|[A-Za-z0-9_/=+-]{30,}'''
+keywords = ["Atzr|"]
+
+[[rules]]
+id = "amazon-lwa-client-secret"
+description = "Amazon LWA client secret (amzn1.oa2-cs.v1.)"
+regex = '''amzn1\.oa2-cs\.v1\.[A-Za-z0-9]{16,}'''
+keywords = ["amzn1.oa2-cs"]
+
+[[rules]]
+id = "amazon-lwa-client-id"
+description = "Amazon LWA client identifier (amzn1.application-oa2-client.)"
+regex = '''amzn1\.application-oa2-client\.[a-f0-9]{16,}'''
+keywords = ["amzn1.application-oa2-client"]
+
+[[rules]]
+id = "supabase-jwt-key"
+description = "Supabase anon or service_role key (JWT)"
+regex = '''eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}'''
+keywords = ["eyJ"]
+
+[[rules]]
+id = "postgres-connection-string-with-password"
+description = "Postgres / Supabase connection string with an embedded password"
+regex = '''postgres(ql)?://[^:\s/]+:[^@\s]+@[^\s]+'''
+keywords = ["postgresql://", "postgres://"]
+
+[allowlist]
+description = "Allow placeholders, the .env template, and this config's own rule definitions"
+paths = [
+  '''\.env\.example$''',
+  '''\.gitleaks\.toml$''',
+]
+regexes = [
+  '''<<PASTE[^>]*>>''',
+  '''PASTE_[A-Z_]+_HERE''',
+  '''\[YOUR-PASSWORD\]''',
+]
