@@ -1,26 +1,36 @@
 name: Daily Sync
 
-# Pulls the last 30 days of Sales & Traffic data from SP-API into your
-# Supabase database. Idempotent — re-running re-syncs without duplicating.
+# Pulls a short rolling window of Sales & Traffic data from SP-API into
+# Supabase. Idempotent — re-running re-syncs without duplicating.
+#
+# RW-AI-OS customisation (see seller-sessions-2026/implementation-plan.md):
+# the upstream workflow pulled --months 1 (30 createReport calls) at
+# --concurrency 2 with no delay. The Sales & Traffic createReport quota is
+# very low (~1/min) and 429s in practice even with a 30s delay, so a daily
+# 30-call job is not viable. A *daily* sync only needs yesterday plus a few
+# days of restatement buffer — Amazon restates S&T for ~2–3 days. We pull a
+# 5-day rolling window at --concurrency 1 --delay 8000. For a larger
+# historical catch-up, run `npm run backfill` locally as a gentle overnight
+# job rather than from Actions (a 24-month pull cannot fit the 60m timeout).
 #
 # To enable:
-# 1. Fork or clone this repo to your GitHub account.
-# 2. In your repo's Settings → Secrets and variables → Actions, add the
-#    secrets listed under env: below. Use the same values as your local .env.
-# 3. Enable Actions in the Actions tab if it isn't already.
+# 1. In Settings → Secrets and variables → Actions, add the secrets listed
+#    under env: below. Use the same values as the local .env.
+# 2. Enable Actions in the Actions tab if it isn't already.
 #
 # Schedule: 15:00 UTC daily. Sales & Traffic data lands by 14:00 UTC, so
-# 15:00 gives Amazon an hour of buffer.
+# 15:00 gives Amazon an hour of buffer. (pg_cron also rolls up at 14:30;
+# this run re-pulls source data and re-rolls for the cleanest read.)
 
 on:
   schedule:
     - cron: '0 15 * * *'
   workflow_dispatch:
     inputs:
-      months:
-        description: 'How many months back to pull (default: 1 = last 30 days)'
+      days:
+        description: 'How many days back to pull (default: 5 = yesterday + restatement buffer)'
         type: string
-        default: '1'
+        default: '5'
 
 permissions:
   contents: read
@@ -52,8 +62,12 @@ jobs:
           SP_API_REGION: ${{ secrets.SP_API_REGION }}
           SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
         run: |
-          MONTHS="${{ github.event.inputs.months || '1' }}"
-          npm run backfill -- --source amazon --report sales-traffic --months "$MONTHS" --concurrency 2
+          DAYS="${{ github.event.inputs.days || '5' }}"
+          FROM=$(date -u -d "${DAYS} days ago" +%F)
+          TO=$(date -u -d "yesterday" +%F)
+          echo "Pulling Sales & Traffic ${FROM} → ${TO} (concurrency 1, 8s delay between days)"
+          npm run backfill -- --source amazon --report sales-traffic \
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
 
       - name: Roll up rollups
         env:
