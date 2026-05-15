@@ -6,15 +6,18 @@ name: Daily Sync
 # RW-AI-OS customisation (see seller-sessions-2026/implementation-plan.md):
 # the upstream workflow pulled --months 1 (30 createReport calls) at
 # --concurrency 2 with no delay. The Sales & Traffic createReport quota on
-# this (brand-new) LWA app is on Amazon's floor: ~3 calls succeed, then a
-# hard 429 QuotaExceeded that the inter-call delay does not clear (observed
-# identically at --delay 8000 and --delay 30000 — it is a tiny burst bucket
-# with a very slow refill, not a per-minute rate). So a *daily* sync pulls a
-# 2-day rolling window (yesterday + 1 day restatement buffer) at
-# --concurrency 1 --delay 8000 — comfortably under the ~3-call wall. The
-# window can widen once Amazon raises the app's rate limit with usage history.
-# Larger historical catch-ups stay a local `npm run backfill` job run gently
-# overnight; they cannot fit the Actions timeout under this quota.
+# this (brand-new) LWA app is a small burst bucket (~3 calls) with a slow
+# refill, so an unbounded delay alone does not clear it. We pull a 3-day
+# rolling window (yesterday + a 2-day restatement buffer) at --concurrency 1
+# --delay 8000. Amazon restates S&T for 2-3 days; a 2-day window misses
+# D-3 restatements (observed live on 2026-05-14: 11 May drifted by £21.98
+# after our morning pull, invisible until manually re-pulled). The 3rd call
+# can trip the burst ceiling, but client.ts now honours
+# x-amzn-RateLimit-Limit / Retry-After on 429 so it waits for the bucket
+# rather than failing the run. The window will widen further once Amazon
+# raises the app's rate limit with usage history. Large historical
+# catch-ups stay a local `npm run backfill` job; they cannot fit the
+# Actions timeout under this quota.
 #
 # To enable:
 # 1. In Settings → Secrets and variables → Actions, add the secrets listed
@@ -31,9 +34,9 @@ on:
   workflow_dispatch:
     inputs:
       days:
-        description: 'Days back to pull (default: 2 = yesterday + buffer; >3 will 429 on the current quota)'
+        description: 'Days back to pull (default: 3 = yesterday + 2-day restatement buffer; >4 may hit the quota wall)'
         type: string
-        default: '2'
+        default: '3'
 
 permissions:
   contents: read
@@ -65,7 +68,7 @@ jobs:
           SP_API_REGION: ${{ secrets.SP_API_REGION }}
           SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
         run: |
-          DAYS="${{ github.event.inputs.days || '2' }}"
+          DAYS="${{ github.event.inputs.days || '3' }}"
           FROM=$(date -u -d "${DAYS} days ago" +%F)
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} (concurrency 1, 8s delay between days)"
