@@ -25,32 +25,49 @@ They work independently. They're far more valuable together.
 
 ### Step 1 — Add the Supabase MCP server to Claude Code
 
-Claude Code talks to the data lake through Supabase's official hosted MCP server. There is
-nothing to install and no key to store. You add one remote server and authenticate with your
-Supabase login:
+Claude Code talks to the data lake through Supabase's official MCP server, run as a local
+stdio process. The hosted variant (`https://mcp.supabase.com/mcp` with OAuth) was the first
+attempt and is not used here: its OAuth handshake fails on Claude Code with
+`{"message":"resource: Resource must be a valid MCP endpoint"}` whenever the URL carries the
+`read_only` / `project_ref` query parameters we need. The local stdio approach below avoids
+OAuth entirely.
 
+Generate a Supabase personal access token at
+`https://supabase.com/dashboard/account/tokens` (name it
+`claude-code-<who>-<machine>-<YYYY-MM-DD>`, 90-day expiry). Then edit `~/.claude.json` and
+add this entry under `mcpServers`:
+
+```jsonc
+"supabase": {
+  "type": "stdio",
+  "command": "npx",
+  "args": [
+    "-y", "@supabase/mcp-server-supabase@latest",
+    "--read-only", "--project-ref=YOUR_PROJECT_REF"
+  ],
+  "env": { "SUPABASE_ACCESS_TOKEN": "<your PAT>" }
+}
 ```
-claude mcp add --transport http supabase \
-  "https://mcp.supabase.com/mcp?project_ref=YOUR_PROJECT_REF&read_only=true" --scope user
-```
 
-Replace `YOUR_PROJECT_REF` with your Supabase project ref. It is the subdomain of your
-project URL and also appears in the dashboard URL. It is not a secret.
+Replace `YOUR_PROJECT_REF` with your Supabase project ref (the subdomain of your project
+URL; not a secret). The two CLI flags matter:
 
-The two query parameters matter:
+- `--read-only` makes every SQL query run as a read-only Postgres user. The guardrail.
+- `--project-ref=…` scopes the connection to one project and removes account-level tools
+  from the surface.
 
-- `read_only=true` runs every query as a read-only Postgres user. Keep it in the URL. It is
-  the guardrail.
-- `project_ref=...` scopes the connection to one project and disables account-level tools.
+Windows uses `cmd /c` as the `command` and prepends `/c` to `args` (Git Bash mangles `/c`
+otherwise). macOS and Linux use `npx` directly as shown.
 
-Then, inside Claude Code, run `/mcp`, select the `supabase` server, and complete the browser
-login. Run `/mcp` again and it should show the server connected with a tool count.
+Reload Claude Code (Command Palette → "Developer: Reload Window") so the stdio process
+spawns. Then run `/mcp`; the `supabase` server should show as Connected.
 
 Do not configure this with `SUPABASE_SERVICE_ROLE_KEY`. The service role key bypasses every
-access control in the database. The hosted server with `read_only=true` plus your own login
-is both simpler and safer, and it keeps no secret in a config file.
+access control in the database. The PAT plus `--read-only` plus `--project-ref` is both
+simpler and safer.
 
-For a step-by-step macOS walkthrough aimed at a non-technical operator, see
+For a step-by-step macOS walkthrough aimed at an operator following the recipe blind,
+including a write-rejection test and a token-rotation flow, see
 [`docs/runbooks/connect-data-lake-macos.md`](runbooks/connect-data-lake-macos.md).
 
 ### Step 2 — Tell Claude what to do with it
