@@ -120,7 +120,7 @@ jobs:
           # re-running replaces the day's rows.
           npm run inventory-snapshot
 
-      - name: Pull Ads SP daily (D-1)
+      - name: Pull Ads SP + SD daily (D-1)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
