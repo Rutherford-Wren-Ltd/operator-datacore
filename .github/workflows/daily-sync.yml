@@ -44,7 +44,11 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Step budget at worst case: S&T ~2 min + rollup <1 min + FBA inventory ~25 min
+    # + Ads SP up to 30 min (Amazon's report queue is slow and unpredictable).
+    # 90 minutes gives meaningful headroom; tighten once we have real workflow
+    # timing data from a few runs.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
@@ -115,3 +119,28 @@ jobs:
           # the Sales & Traffic pull above consumes. Idempotent for the day:
           # re-running replaces the day's rows.
           npm run inventory-snapshot
+
+      - name: Pull Ads SP daily (D-1)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ADS_API_CLIENT_ID: ${{ secrets.ADS_API_CLIENT_ID }}
+          ADS_API_CLIENT_SECRET: ${{ secrets.ADS_API_CLIENT_SECRET }}
+          ADS_API_REFRESH_TOKEN: ${{ secrets.ADS_API_REFRESH_TOKEN }}
+          ADS_PROFILE_ID: ${{ secrets.ADS_PROFILE_ID }}
+          ADS_API_REGION: ${{ secrets.ADS_API_REGION }}
+          ADS_API_ENDPOINT: ${{ secrets.ADS_API_ENDPOINT }}
+        run: |
+          # Sponsored Products advertised-product report for yesterday.
+          # Async report: createReport → poll (~1–10 min) → gzipped JSON download
+          # → upsert into brain.ads_sp_daily. Idempotent for the date.
+          #
+          # Attribution windows (sales_7d/14d/30d on a given day) keep growing
+          # for up to 30 days as Amazon attributes downstream conversions. We
+          # currently capture each day once at D-1; the 30-day numbers are
+          # therefore as-of-D rather than fully-ripened. Re-pulling older days
+          # to capture ripening is a follow-up (rolling window or a weekly
+          # 30-day re-sync).
+          npm run ads-ingest
