@@ -37,6 +37,8 @@ export interface AdsApiRequest {
   profileId?: string;
   /** Override Accept header for endpoints that need a versioned content type. */
   accept?: string;
+  /** Override Content-Type header (Reports v3 needs a versioned MIME type). */
+  contentType?: string;
 }
 
 export interface AdsApiResponse<T> {
@@ -109,7 +111,7 @@ export class AdsApiClient {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${token}`,
       'Amazon-Advertising-API-ClientId': this.opts.clientId,
-      'Content-Type': 'application/json',
+      'Content-Type': req.contentType ?? 'application/json',
       Accept: req.accept ?? 'application/json',
       'User-Agent': 'operator-datacore/0.1 (Language=TypeScript)',
     };
