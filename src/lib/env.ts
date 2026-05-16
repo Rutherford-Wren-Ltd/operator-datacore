@@ -3,6 +3,11 @@ import { z } from 'zod';
 
 config();
 
+// Treat empty-string env vars (e.g. `FOO=` left as a TODO placeholder in .env)
+// as if they were unset, so `.optional()` actually means "may be unset".
+const emptyToUndef = (schema: z.ZodTypeAny) =>
+  z.preprocess((v) => (v === '' ? undefined : v), schema);
+
 const Schema = z.object({
   // Supabase
   SUPABASE_URL: z.string().url(),
@@ -16,6 +21,14 @@ const Schema = z.object({
   SP_API_REFRESH_TOKEN: z.string().min(1).optional(),
   SP_API_REGION: z.enum(['na', 'eu', 'fe']).default('na'),
   SP_API_MARKETPLACE_IDS: z.string().default('ATVPDKIKX0DER'),
+
+  // Amazon Ads API (separate LWA app from SP-API above)
+  ADS_API_CLIENT_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_CLIENT_SECRET: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  ADS_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_REGION: emptyToUndef(z.enum(['NA', 'EU', 'FE']).default('EU')),
+  ADS_API_ENDPOINT: emptyToUndef(z.string().url().optional()),
 
   // Behaviour
   BACKFILL_MONTHS: z.coerce.number().int().min(1).max(36).default(24),
@@ -75,4 +88,22 @@ export function loadEnvForAmazon(): Env & {
 
 export function getMarketplaceIds(env: Env = loadEnv()): string[] {
   return env.SP_API_MARKETPLACE_IDS.split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+export function loadEnvForAds(): Env & {
+  ADS_API_CLIENT_ID: string;
+  ADS_API_CLIENT_SECRET: string;
+  ADS_API_REFRESH_TOKEN: string;
+} {
+  const env = loadEnv();
+  if (!env.ADS_API_CLIENT_ID || !env.ADS_API_CLIENT_SECRET || !env.ADS_API_REFRESH_TOKEN) {
+    throw new Error(
+      'Amazon Ads API credentials missing. Set ADS_API_CLIENT_ID, ADS_API_CLIENT_SECRET, ADS_API_REFRESH_TOKEN in .env. See docs/runbooks/connect-amazon-ads.md.',
+    );
+  }
+  return env as Env & {
+    ADS_API_CLIENT_ID: string;
+    ADS_API_CLIENT_SECRET: string;
+    ADS_API_REFRESH_TOKEN: string;
+  };
 }

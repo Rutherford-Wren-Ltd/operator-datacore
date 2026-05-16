@@ -39,6 +39,8 @@
     "backfill:amazon:sales-traffic": "tsx src/cli/backfill.ts --source amazon --report sales-traffic",
     "incremental": "tsx src/cli/backfill.ts --source amazon --report sales-traffic --months 1 --concurrency 2",
     "inventory-snapshot": "tsx src/cli/inventory-snapshot.ts",
+    "ads-probe": "tsx src/cli/ads-probe.ts",
+    "ads-exchange-code": "tsx src/cli/ads-exchange-code.ts",
     "verify": "tsx src/cli/verify.ts",
     "exchange-code": "tsx src/cli/exchange-code.ts",
     "check:migrations": "tsx src/cli/check-migrations.ts",
