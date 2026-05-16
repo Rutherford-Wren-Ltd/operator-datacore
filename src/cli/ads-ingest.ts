@@ -1,16 +1,23 @@
 #!/usr/bin/env tsx
 // ============================================================================
 // ads-ingest.ts
-// Pulls Sponsored Products advertised-product reports from the Amazon Ads
-// API and upserts into brain.ads_sp_daily.
+// Pulls Amazon Ads advertised-product reports and upserts into:
+//   - brain.ads_sp_daily (Sponsored Products)
+//   - brain.ads_sd_daily (Sponsored Display)
 //
 // Defaults to yesterday's data (Ads reports for "today" are not ready until
 // late evening; sticking to D-1 avoids partial-day rows).
 //
 // Usage:
-//   npm run ads-ingest                # yesterday
-//   npm run ads-ingest -- --days 7    # last 7 days (one report per day)
-//   npm run ads-ingest -- --date 2026-05-14   # one specific date
+//   npm run ads-ingest                          # yesterday, SP + SD
+//   npm run ads-ingest -- --days 7              # last 7 days, SP + SD
+//   npm run ads-ingest -- --date 2026-05-14     # one specific date
+//   npm run ads-ingest -- --products SP         # SP only
+//   npm run ads-ingest -- --products SD         # SD only
+//
+// SP and SD reports for the same date are kicked off in parallel — each
+// spends 5-15 min waiting on Amazon's report queue, and they sit on
+// separate quota buckets, so running concurrently roughly halves wall time.
 // ============================================================================
 
 import { parseArgs } from 'node:util';
@@ -19,12 +26,16 @@ import { getPgClient } from '../lib/supabase.js';
 import { AdsApiClient } from '../lib/ads-api/client.js';
 import { getProfiles } from '../lib/ads-api/profiles.js';
 import { ingestSpDaily } from '../lib/ads-api/sp-ingest.js';
+import { ingestSdDaily } from '../lib/ads-api/sd-ingest.js';
+
+type AdProductKey = 'SP' | 'SD';
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
       date: { type: 'string' },
       days: { type: 'string' },
+      products: { type: 'string' },
     },
   });
 
@@ -36,11 +47,13 @@ async function main(): Promise<void> {
   }
 
   const dates = resolveDates(values.date, values.days);
+  const products = resolveProducts(values.products);
 
-  console.log('operator-datacore — Amazon Ads SP ingest');
-  console.log('-----------------------------------------');
+  console.log('operator-datacore — Amazon Ads ingest');
+  console.log('--------------------------------------');
   console.log(`  Region:        ${env.ADS_API_REGION}`);
   console.log(`  Profile ID:    ${env.ADS_PROFILE_ID}`);
+  console.log(`  Products:      ${products.join(', ')}`);
   console.log(`  Dates:         ${dates[0]}${dates.length > 1 ? ` … ${dates[dates.length - 1]} (${dates.length} day${dates.length === 1 ? '' : 's'})` : ''}`);
   console.log('');
 
@@ -53,8 +66,6 @@ async function main(): Promise<void> {
     ...(env.ADS_API_ENDPOINT ? { endpoint: env.ADS_API_ENDPOINT } : {}),
   });
 
-  // Currency is per-profile (UK = GBP, DE = EUR, etc). Resolve via /v2/profiles
-  // rather than env so the CLI works for any profile without config changes.
   const profiles = await getProfiles(adsClient);
   const profile = profiles.find((p) => String(p.profileId) === String(env.ADS_PROFILE_ID));
   if (!profile) {
@@ -69,43 +80,63 @@ async function main(): Promise<void> {
 
   try {
     const startedAt = Date.now();
-    let totalRows = 0;
+    const totals: Record<AdProductKey, number> = { SP: 0, SD: 0 };
 
     for (const date of dates) {
       console.log(`Date ${date}:`);
-      const result = await ingestSpDaily({
-        adsClient,
-        pg,
-        profileId: env.ADS_PROFILE_ID,
-        startDate: date,
-        endDate: date,
-        currencyCode: profile.currencyCode,
-        poll: {
-          onPoll: ({ attempt, status, elapsedMs }) => {
-            console.log(`  poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s elapsed)`);
-          },
+      const pollLogger = (label: string) => ({
+        onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
+          console.log(`  [${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s elapsed)`);
         },
       });
-      totalRows += result.rowsUpserted;
-      console.log(`  done: ${result.rowsUpserted} row(s) upserted (reportId ${result.reportId})`);
+
+      const jobs: Array<Promise<{ product: AdProductKey; rows: number; reportId: string }>> = [];
+      if (products.includes('SP')) {
+        jobs.push(
+          ingestSpDaily({
+            adsClient,
+            pg,
+            profileId: env.ADS_PROFILE_ID,
+            startDate: date,
+            endDate: date,
+            currencyCode: profile.currencyCode,
+            poll: pollLogger('SP'),
+          }).then((r) => ({ product: 'SP' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
+        );
+      }
+      if (products.includes('SD')) {
+        jobs.push(
+          ingestSdDaily({
+            adsClient,
+            pg,
+            profileId: env.ADS_PROFILE_ID,
+            startDate: date,
+            endDate: date,
+            currencyCode: profile.currencyCode,
+            poll: pollLogger('SD'),
+          }).then((r) => ({ product: 'SD' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
+        );
+      }
+
+      const results = await Promise.all(jobs);
+      for (const r of results) {
+        console.log(`  [${r.product}] done: ${r.rows} row(s) upserted (reportId ${r.reportId})`);
+        totals[r.product] += r.rows;
+      }
     }
 
     const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
     console.log('');
-    console.log(`Done in ${durationSec}s. ${totalRows} SP-daily row(s) total.`);
-    console.log('Next: /sku-audit will now produce a real TACoS score for advertised ASINs.');
+    console.log(`Done in ${durationSec}s.`);
+    for (const p of products) {
+      console.log(`  ${p}: ${totals[p]} row(s) total → brain.ads_${p.toLowerCase()}_daily`);
+    }
+    console.log('Next: /sku-audit will produce a real TACoS score for advertised ASINs.');
   } finally {
     await pg.end();
   }
 }
 
-/**
- * Resolve the list of YYYY-MM-DD dates to pull. Most recent day first is fine
- * for backfill; iteration order doesn't matter to the upsert.
- *
- * "Yesterday" means UTC yesterday — Ads reports use UTC, and matching that
- * avoids off-by-one when the workflow runs at 15:00 UTC.
- */
 function resolveDates(date: string | undefined, days: string | undefined): string[] {
   if (date) return [date];
 
@@ -117,6 +148,18 @@ function resolveDates(date: string | undefined, days: string | undefined): strin
     out.push(d.toISOString().slice(0, 10));
   }
   return out;
+}
+
+function resolveProducts(products: string | undefined): AdProductKey[] {
+  if (!products) return ['SP', 'SD'];
+  const parsed = products
+    .split(',')
+    .map((s) => s.trim().toUpperCase())
+    .filter((s): s is AdProductKey => s === 'SP' || s === 'SD');
+  if (parsed.length === 0) {
+    throw new Error(`--products must be a comma-separated list of: SP, SD. Got "${products}".`);
+  }
+  return parsed;
 }
 
 main().catch((err) => {
