@@ -8,6 +8,53 @@ config();
 const emptyToUndef = (schema: z.ZodTypeAny) =>
   z.preprocess((v) => (v === '' ? undefined : v), schema);
 
+/**
+ * Repair env values that have surrounding whitespace or stray quote characters.
+ *
+ * Why this exists: dotenv strips PAIRED surrounding quotes when loading .env,
+ * but PowerShell / shell scripts reading .env directly do not. The mismatch
+ * means a value can look fine via `npm run X` (dotenv-cleaned) but fail when
+ * the same .env is read another way and uploaded to (e.g.) GitHub Secrets.
+ * Asymmetric quotes — only one of leading/trailing — also defeat dotenv's
+ * paired-stripping logic and silently produce a broken value at the LWA
+ * endpoint with an `invalid_client` / `invalid_grant` error.
+ *
+ * Repair strategy:
+ *   - Trim leading/trailing whitespace.
+ *   - Strip paired surrounding double or single quotes silently (this is the
+ *     standard dotenv behaviour — re-applying it here covers env vars that
+ *     came from somewhere other than dotenv, e.g. GitHub Secrets).
+ *   - If only ONE side has a quote after pair-stripping, strip it AND emit
+ *     a loud warning. Asymmetric quotes are almost always a malformed .env
+ *     and the operator needs to know.
+ *
+ * Anything weirder than that we leave to zod to fail noisily on.
+ */
+function repairEnvValue(key: string, raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === null) return raw;
+  let v = raw;
+  const trimmed = v.trim();
+  if (trimmed !== v) {
+    console.warn(`[env] ${key}: stripped surrounding whitespace`);
+    v = trimmed;
+  }
+  if (v.length >= 2 && v[0] === '"' && v[v.length - 1] === '"') {
+    v = v.slice(1, -1);
+  } else if (v.length >= 2 && v[0] === "'" && v[v.length - 1] === "'") {
+    v = v.slice(1, -1);
+  } else {
+    if (v.length >= 1 && (v[0] === '"' || v[0] === "'")) {
+      console.warn(`[env] ${key}: stripped a lone leading quote — your .env is probably malformed`);
+      v = v.slice(1);
+    }
+    if (v.length >= 1 && (v[v.length - 1] === '"' || v[v.length - 1] === "'")) {
+      console.warn(`[env] ${key}: stripped a lone trailing quote — your .env is probably malformed`);
+      v = v.slice(0, -1);
+    }
+  }
+  return v;
+}
+
 const Schema = z.object({
   // Supabase
   SUPABASE_URL: z.string().url(),
@@ -55,7 +102,13 @@ let cached: Env | null = null;
 
 export function loadEnv(): Env {
   if (cached) return cached;
-  const parsed = Schema.safeParse(process.env);
+  // Run every value through repairEnvValue before zod parsing so quote /
+  // whitespace artefacts in .env (or in GitHub Secrets) don't slip through.
+  const repaired: Record<string, string | undefined> = {};
+  for (const key of Object.keys(Schema.shape)) {
+    repaired[key] = repairEnvValue(key, process.env[key]);
+  }
+  const parsed = Schema.safeParse(repaired);
   if (!parsed.success) {
     const issues = parsed.error.issues
       .map((i) => `  - ${i.path.join('.')}: ${i.message}`)
