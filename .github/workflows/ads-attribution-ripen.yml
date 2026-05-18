@@ -1,0 +1,103 @@
+name: Ads Attribution Ripen
+
+# Re-pulls the last N days of Amazon Ads SP + SD data for both EU and NA
+# regions on a weekly schedule. Why:
+#
+# Amazon attributes downstream conversions (clicks → purchases) for up to
+# 30 days post-click. The daily-sync workflow pulls each day's Ads data
+# once at D-1, which captures only "1 day of attribution" on every metric.
+# Those numbers then freeze in brain.ads_sp_daily / brain.ads_sd_daily,
+# misrepresenting the true attributed sales by a wide margin after a few
+# weeks.
+#
+# This workflow re-pulls the trailing N days (default 7) every Sunday at
+# 18:00 UTC, bringing sales_7d / sales_14d / sales_30d closer to their
+# final values. After each Sunday run, the most recent week of data is
+# "ripe"; the further back you go, the more stale until next Sunday.
+#
+# Why 7 days, not 30:
+#   - Most attribution growth happens in the first 7 days post-click
+#   - 30 days × 2 regions sequentially > GitHub Actions 6-hour job limit
+#   - 7 days × 2 regions running in PARALLEL jobs fits comfortably
+#     (~70 min per job, ~75 min total wall time)
+#
+# Why a separate workflow (not folded into daily-sync):
+#   - Daily-sync stays fast (~50 min) for next-morning operator review
+#   - This is heavier (~75 min) and naturally weekly-cadence
+#   - Independent failure modes — if attribution-ripen breaks, daily
+#     pulls keep working
+#
+# Manual trigger:
+#   GitHub Actions → "Ads Attribution Ripen" → Run workflow. Use the
+#   "days" input to override (1-30). Useful after a multi-day outage
+#   or before a Monday meeting where Sunday's run wasn't enough.
+
+on:
+  schedule:
+    - cron: '0 18 * * 0'   # Sundays 18:00 UTC
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Days back to re-pull (default 7; max 30)'
+        type: string
+        default: '7'
+
+permissions:
+  contents: read
+
+jobs:
+  ripen-eu:
+    name: Ripen EU Ads (last N days)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Re-pull EU Ads data
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ADS_API_CLIENT_ID: ${{ secrets.ADS_API_CLIENT_ID }}
+          ADS_API_CLIENT_SECRET: ${{ secrets.ADS_API_CLIENT_SECRET }}
+          ADS_API_REFRESH_TOKEN: ${{ secrets.ADS_API_REFRESH_TOKEN }}
+          ADS_PROFILE_ID: ${{ secrets.ADS_PROFILE_ID }}
+          ADS_API_REGION: ${{ secrets.ADS_API_REGION }}
+          ADS_API_ENDPOINT: ${{ secrets.ADS_API_ENDPOINT }}
+        run: |
+          DAYS="${{ github.event.inputs.days || '7' }}"
+          echo "Re-pulling last ${DAYS} days of EU Ads data (SP + SD)"
+          npm run ads-ingest -- --days "$DAYS"
+
+  ripen-na:
+    name: Ripen NA Ads (last N days)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Re-pull NA Ads data
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ADS_API_CLIENT_ID: ${{ secrets.ADS_API_CLIENT_ID }}
+          ADS_API_CLIENT_SECRET: ${{ secrets.ADS_API_CLIENT_SECRET }}
+          ADS_API_NA_REFRESH_TOKEN: ${{ secrets.ADS_API_NA_REFRESH_TOKEN }}
+          ADS_API_NA_PROFILE_ID: ${{ secrets.ADS_API_NA_PROFILE_ID }}
+        run: |
+          DAYS="${{ github.event.inputs.days || '7' }}"
+          echo "Re-pulling last ${DAYS} days of NA Ads data (SP + SD)"
+          npm run ads-ingest -- --region NA --days "$DAYS"
