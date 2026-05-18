@@ -47,11 +47,21 @@ import { ingestSdDaily } from '../lib/ads-api/sd-ingest.js';
 
 type AdProductKey = 'SP' | 'SD';
 
-interface ProfileDateResult {
+interface ProfileDateSuccess {
+  ok: true;
   profile: AdsProfile;
   date: string;
   byProduct: Record<AdProductKey, { rows: number; reportId: string } | undefined>;
 }
+
+interface ProfileDateFailure {
+  ok: false;
+  profile: AdsProfile;
+  date: string;
+  error: Error;
+}
+
+type ProfileDateOutcome = ProfileDateSuccess | ProfileDateFailure;
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -115,10 +125,17 @@ async function main(): Promise<void> {
   try {
     const startedAt = Date.now();
     const totals: Record<AdProductKey, number> = { SP: 0, SD: 0 };
+    const failures: ProfileDateFailure[] = [];
+    let successCount = 0;
 
     // For each date, batch profiles into groups of `concurrency` and run
     // each batch in parallel. Within each batched profile, SP + SD still
     // run in parallel — effective concurrent reports per batch is 2 × N.
+    //
+    // ingestProfileDate never throws — failures are returned as outcomes
+    // so one profile's failure doesn't take down the rest of the batch.
+    // A failure summary is printed at end and exit code reflects whether
+    // any profile-dates failed.
     for (const date of dates) {
       console.log(`Date ${date}:`);
 
@@ -129,7 +146,7 @@ async function main(): Promise<void> {
           : null;
         if (batchLabel) console.log(batchLabel);
 
-        const results = await Promise.all(
+        const outcomes = await Promise.all(
           batch.map((profile) =>
             ingestProfileDate({
               profile,
@@ -142,14 +159,21 @@ async function main(): Promise<void> {
           ),
         );
 
-        for (const result of results) {
-          console.log(`  Profile ${result.profile.profileId} — ${result.profile.accountInfo.name} (${result.profile.countryCode}):`);
-          for (const product of products) {
-            const r = result.byProduct[product];
-            if (r) {
-              console.log(`    [${product}] ${r.rows} row(s) upserted (reportId ${r.reportId})`);
-              totals[product] += r.rows;
+        for (const outcome of outcomes) {
+          const profileLabel = `${outcome.profile.profileId} — ${outcome.profile.accountInfo.name} (${outcome.profile.countryCode})`;
+          if (outcome.ok) {
+            console.log(`  Profile ${profileLabel}:`);
+            successCount += 1;
+            for (const product of products) {
+              const r = outcome.byProduct[product];
+              if (r) {
+                console.log(`    [${product}] ${r.rows} row(s) upserted (reportId ${r.reportId})`);
+                totals[product] += r.rows;
+              }
             }
+          } else {
+            console.error(`  Profile ${profileLabel}: FAILED — ${outcome.error.message.split('\n')[0]}`);
+            failures.push(outcome);
           }
         }
       }
@@ -157,10 +181,26 @@ async function main(): Promise<void> {
     }
 
     const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-    console.log(`Done in ${durationSec}s.`);
+    console.log(`Done in ${durationSec}s. ${successCount} profile-date(s) succeeded, ${failures.length} failed.`);
     for (const p of products) {
       console.log(`  ${p}: ${totals[p]} row(s) total → brain.ads_${p.toLowerCase()}_daily`);
     }
+
+    if (failures.length > 0) {
+      console.error('');
+      console.error(`${failures.length} profile-date(s) failed (rows from successful profile-dates ARE in the lake; failures will retry on the next sync):`);
+      for (const f of failures) {
+        console.error(`  ${f.profile.profileId} (${f.profile.accountInfo.name}, ${f.profile.countryCode}) [${f.date}]:`);
+        console.error(`    ${f.error.message.split('\n').slice(0, 3).join('\n    ')}`);
+      }
+      console.log('Next: /sku-audit will produce a real TACoS score for advertised ASINs that DID land successfully.');
+      // Exit non-zero so the workflow shows red and the operator gets a
+      // failure notification — but only after the successful profile-dates
+      // have already committed their rows.
+      process.exitCode = 1;
+      return;
+    }
+
     console.log('Next: /sku-audit will produce a real TACoS score for advertised ASINs.');
   } finally {
     await pg.end();
@@ -180,68 +220,81 @@ interface IngestProfileDateOpts {
 }
 
 /**
- * Run SP + SD ingest in parallel for one (profile, date). Returns per-product
- * row counts and reportIds. SP and SD failures are not swallowed — they
- * surface as rejected promises and bubble up to the caller's Promise.all.
+ * Run SP + SD ingest in parallel for one (profile, date). Returns an
+ * outcome union — never throws. The caller uses the discriminator
+ * (`outcome.ok`) to decide how to aggregate.
+ *
+ * Why this never throws: with multiple profiles batched in parallel,
+ * one profile's failure would otherwise short-circuit the whole batch
+ * and red the entire workflow run — even though the OTHER profiles in
+ * the batch (and earlier batches' profiles) already wrote their rows
+ * successfully. We want isolated failure: capture the error, keep
+ * going, summarise at end.
  */
-async function ingestProfileDate(opts: IngestProfileDateOpts): Promise<ProfileDateResult> {
+async function ingestProfileDate(opts: IngestProfileDateOpts): Promise<ProfileDateOutcome> {
   const { profile, date, env, config, products, pg } = opts;
   const profileId = String(profile.profileId);
 
-  const scopedClient = new AdsApiClient({
-    region: config.region,
-    clientId: env.ADS_API_CLIENT_ID,
-    clientSecret: env.ADS_API_CLIENT_SECRET,
-    refreshToken: config.refreshToken,
-    endpoint: config.endpoint,
-    profileId,
-  });
+  try {
+    const scopedClient = new AdsApiClient({
+      region: config.region,
+      clientId: env.ADS_API_CLIENT_ID,
+      clientSecret: env.ADS_API_CLIENT_SECRET,
+      refreshToken: config.refreshToken,
+      endpoint: config.endpoint,
+      profileId,
+    });
 
-  // Per-product poll loggers prefix profile + date so concurrent profile
-  // logs interleave readably.
-  const pollLogger = (label: string) => ({
-    onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
-      console.log(
-        `    [${profileId} ${date} ${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s)`,
+    const pollLogger = (label: string) => ({
+      onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
+        console.log(
+          `    [${profileId} ${date} ${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s)`,
+        );
+      },
+    });
+
+    const byProduct: ProfileDateSuccess['byProduct'] = { SP: undefined, SD: undefined };
+    const jobs: Array<Promise<void>> = [];
+    if (products.includes('SP')) {
+      jobs.push(
+        ingestSpDaily({
+          adsClient: scopedClient,
+          pg,
+          profileId,
+          startDate: date,
+          endDate: date,
+          currencyCode: profile.currencyCode,
+          poll: pollLogger('SP'),
+        }).then((r) => {
+          byProduct.SP = { rows: r.rowsUpserted, reportId: r.reportId };
+        }),
       );
-    },
-  });
-
-  const result: ProfileDateResult = { profile, date, byProduct: { SP: undefined, SD: undefined } };
-
-  const jobs: Array<Promise<void>> = [];
-  if (products.includes('SP')) {
-    jobs.push(
-      ingestSpDaily({
-        adsClient: scopedClient,
-        pg,
-        profileId,
-        startDate: date,
-        endDate: date,
-        currencyCode: profile.currencyCode,
-        poll: pollLogger('SP'),
-      }).then((r) => {
-        result.byProduct.SP = { rows: r.rowsUpserted, reportId: r.reportId };
-      }),
-    );
+    }
+    if (products.includes('SD')) {
+      jobs.push(
+        ingestSdDaily({
+          adsClient: scopedClient,
+          pg,
+          profileId,
+          startDate: date,
+          endDate: date,
+          currencyCode: profile.currencyCode,
+          poll: pollLogger('SD'),
+        }).then((r) => {
+          byProduct.SD = { rows: r.rowsUpserted, reportId: r.reportId };
+        }),
+      );
+    }
+    await Promise.all(jobs);
+    return { ok: true, profile, date, byProduct };
+  } catch (err) {
+    return {
+      ok: false,
+      profile,
+      date,
+      error: err instanceof Error ? err : new Error(String(err)),
+    };
   }
-  if (products.includes('SD')) {
-    jobs.push(
-      ingestSdDaily({
-        adsClient: scopedClient,
-        pg,
-        profileId,
-        startDate: date,
-        endDate: date,
-        currencyCode: profile.currencyCode,
-        poll: pollLogger('SD'),
-      }).then((r) => {
-        result.byProduct.SD = { rows: r.rowsUpserted, reportId: r.reportId };
-      }),
-    );
-  }
-  await Promise.all(jobs);
-  return result;
 }
 
 function resolveDates(date: string | undefined, days: string | undefined): string[] {
