@@ -300,6 +300,75 @@ ORDER BY marketplace_id;
 
 ---
 
+## Inventory health
+
+### What's the current state for one SKU?
+
+```sql
+SELECT *
+FROM analytics.fba_inventory_latest
+WHERE sku = 'MD05GTS';   -- change this
+```
+
+Returns the most recent snapshot row. Only SKUs with actual or inbound inventory appear here (zero-inventory SKUs are filtered at ingest).
+
+### Days-of-cover for one SKU
+
+```sql
+SELECT
+  sku,
+  asin,
+  country_code,
+  afn_fulfillable_quantity,
+  afn_inbound_total,
+  units_per_day,
+  days_on_hand_fulfillable,    -- conservative read (ignores inbound)
+  days_on_hand_with_inbound    -- optimistic read
+FROM analytics.inventory_health
+WHERE sku = 'MD05GTS';   -- change this
+```
+
+`days_on_hand` is `NULL` when there's no 30-day sales velocity (new SKU, paused, or data lake gap). That's intentional — distinguishes "needs investigation" from "out of stock."
+
+### SKUs at risk — under 30 days of cover, sorted by urgency
+
+```sql
+SELECT
+  country_code,
+  sku,
+  asin,
+  product_name,
+  afn_fulfillable_quantity,
+  units_per_day,
+  days_on_hand_fulfillable
+FROM analytics.inventory_health
+WHERE days_on_hand_fulfillable IS NOT NULL
+  AND days_on_hand_fulfillable < 30
+ORDER BY days_on_hand_fulfillable ASC;
+```
+
+The threshold is operator-specific — bump to 60 / 90 for SKUs with long lead times.
+
+### Overstock — SKUs with more than 180 days of cover
+
+```sql
+SELECT
+  country_code,
+  sku,
+  asin,
+  product_name,
+  afn_total_quantity,
+  units_per_day,
+  days_on_hand_total
+FROM analytics.inventory_health
+WHERE days_on_hand_total > 180
+ORDER BY days_on_hand_total DESC;
+```
+
+Useful for spotting capital tied up in slow-moving stock. MD-001's 270-339-day cover (flagged in its first audit) would show up here.
+
+---
+
 ## Audit / debugging
 
 ### How many raw payloads have been ingested but not parsed?
