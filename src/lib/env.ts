@@ -81,13 +81,25 @@ const Schema = z.object({
   SP_API_FE_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
   SP_API_FE_MARKETPLACE_IDS: emptyToUndef(z.string().optional()),
 
-  // Amazon Ads API (separate LWA app from SP-API above)
+  // Amazon Ads API (separate LWA app from SP-API above).
+  // ADS_API_REFRESH_TOKEN + ADS_PROFILE_ID + ADS_API_REGION are the legacy
+  // single-region form (treated as "primary"). To pull a second region in
+  // the same daily-sync, set ADS_API_NA_REFRESH_TOKEN + ADS_API_NA_PROFILE_ID
+  // (or ADS_API_EU_*, ADS_API_FE_*). Client ID + Secret are shared across
+  // regions when one LWA app is authorised in multiple Amazon Ads consoles.
   ADS_API_CLIENT_ID: emptyToUndef(z.string().min(1).optional()),
   ADS_API_CLIENT_SECRET: emptyToUndef(z.string().min(1).optional()),
   ADS_API_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
   ADS_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
   ADS_API_REGION: emptyToUndef(z.enum(['NA', 'EU', 'FE']).default('EU')),
   ADS_API_ENDPOINT: emptyToUndef(z.string().url().optional()),
+  // Additional Ads regions (optional).
+  ADS_API_NA_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_NA_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_EU_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_EU_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_FE_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_FE_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
 
   // Behaviour
   BACKFILL_MONTHS: z.coerce.number().int().min(1).max(36).default(24),
@@ -270,4 +282,91 @@ export function loadEnvForAds(): Env & {
     ADS_API_CLIENT_SECRET: string;
     ADS_API_REFRESH_TOKEN: string;
   };
+}
+
+/**
+ * Same as loadEnvForAds, but validates only the SHARED Ads LWA credentials
+ * (Client ID + Secret) and not the legacy un-prefixed refresh token. Use
+ * from multi-region Ads CLIs where the region is selected via --region flag.
+ * The region-specific refresh token is then resolved via
+ * getAdsApiRegionConfig(region).
+ */
+export function loadEnvForAdsShared(): Env & {
+  ADS_API_CLIENT_ID: string;
+  ADS_API_CLIENT_SECRET: string;
+} {
+  const env = loadEnv();
+  if (!env.ADS_API_CLIENT_ID || !env.ADS_API_CLIENT_SECRET) {
+    throw new Error(
+      'Amazon Ads API shared credentials missing. Set ADS_API_CLIENT_ID and ADS_API_CLIENT_SECRET in .env (or as GitHub Secrets in CI). See docs/runbooks/connect-amazon-ads.md.',
+    );
+  }
+  return env as Env & {
+    ADS_API_CLIENT_ID: string;
+    ADS_API_CLIENT_SECRET: string;
+  };
+}
+
+export type AdsApiRegion = 'NA' | 'EU' | 'FE';
+
+const ADS_API_DEFAULT_ENDPOINTS: Record<AdsApiRegion, string> = {
+  NA: 'https://advertising-api.amazon.com',
+  EU: 'https://advertising-api-eu.amazon.com',
+  FE: 'https://advertising-api-fe.amazon.com',
+};
+
+export interface AdsApiRegionConfig {
+  region: AdsApiRegion;
+  refreshToken: string;
+  /** May be undefined when the operator hasn't pinned a profile yet — the
+   *  probe lists all profiles in that case. Required for any scoped call. */
+  profileId?: string;
+  endpoint: string;
+}
+
+/**
+ * Resolve Ads API credentials for a specific region.
+ *
+ * Lookup order:
+ *   1. Region-prefixed vars (e.g. ADS_API_NA_REFRESH_TOKEN, ADS_API_NA_PROFILE_ID).
+ *   2. If the requested region matches ADS_API_REGION (the "primary"), fall
+ *      back to the legacy un-prefixed ADS_API_REFRESH_TOKEN / ADS_PROFILE_ID.
+ *
+ * Throws if no refresh token can be resolved for the region. Profile ID is
+ * optional (the probe lists all profiles when it isn't pinned). Endpoint
+ * falls back to the region's default if ADS_API_ENDPOINT isn't set.
+ */
+export function getAdsApiRegionConfig(region: AdsApiRegion, env: Env = loadEnv()): AdsApiRegionConfig {
+  const prefixedToken =
+    region === 'NA' ? env.ADS_API_NA_REFRESH_TOKEN
+    : region === 'EU' ? env.ADS_API_EU_REFRESH_TOKEN
+    : env.ADS_API_FE_REFRESH_TOKEN;
+  const prefixedProfile =
+    region === 'NA' ? env.ADS_API_NA_PROFILE_ID
+    : region === 'EU' ? env.ADS_API_EU_PROFILE_ID
+    : env.ADS_API_FE_PROFILE_ID;
+
+  const isPrimary = env.ADS_API_REGION === region;
+
+  let refreshToken: string | undefined = prefixedToken;
+  if (!refreshToken && isPrimary) refreshToken = env.ADS_API_REFRESH_TOKEN;
+
+  let profileId: string | undefined = prefixedProfile;
+  if (!profileId && isPrimary) profileId = env.ADS_PROFILE_ID;
+
+  if (!refreshToken) {
+    throw new Error(
+      `Ads API refresh token not configured for region '${region}'. ` +
+      `Set ADS_API_${region}_REFRESH_TOKEN in .env ` +
+      `(or, if this is your primary region, set ADS_API_REFRESH_TOKEN and ADS_API_REGION=${region}).`,
+    );
+  }
+
+  const config: AdsApiRegionConfig = {
+    region,
+    refreshToken,
+    endpoint: env.ADS_API_ENDPOINT ?? ADS_API_DEFAULT_ENDPOINTS[region],
+  };
+  if (profileId) config.profileId = profileId;
+  return config;
 }
