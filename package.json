@@ -42,6 +42,7 @@
     "ads-probe": "tsx src/cli/ads-probe.ts",
     "ads-exchange-code": "tsx src/cli/ads-exchange-code.ts",
     "ads-ingest": "tsx src/cli/ads-ingest.ts",
+    "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "verify": "tsx src/cli/verify.ts",
     "exchange-code": "tsx src/cli/exchange-code.ts",
     "check:migrations": "tsx src/cli/check-migrations.ts",
