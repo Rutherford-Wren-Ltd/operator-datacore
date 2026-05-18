@@ -79,7 +79,15 @@ async function main(): Promise<void> {
       checks.push({ name: 'SP-API LWA token exchange', status: 'fail', detail: (err as Error).message });
     }
 
-    // 5. SP-API marketplaces
+    // 5. SP-API marketplaces.
+    //
+    // The /sellers/v1/marketplaceParticipations response shape is:
+    //   { payload: [ { marketplace: { id, name, ... }, participation: {...} } ] }
+    // i.e. payload is an ARRAY, not an object with a .marketplaces property.
+    // (Earlier versions of this file parsed `payload.marketplaces` and
+    // always reported "(empty)" regardless of token health — silently
+    // returning a false negative that cost ~1 hour of debugging on
+    // 2026-05-18.)
     try {
       const client = new SpApiClient({
         region: env.SP_API_REGION,
@@ -87,13 +95,18 @@ async function main(): Promise<void> {
         clientSecret: env.SP_API_LWA_CLIENT_SECRET,
         refreshToken: env.SP_API_REFRESH_TOKEN,
       });
-      const res = await client.request<{ payload?: { marketplaces?: Array<{ id: string; name?: string }> } }>(
-        {
-          method: 'GET',
-          path: '/sellers/v1/marketplaceParticipations',
-        },
-      );
-      const ids = res.payload.payload?.marketplaces?.map((m) => `${m.id}${m.name ? ` (${m.name})` : ''}`) ?? [];
+      const res = await client.request<{
+        payload?: Array<{
+          marketplace: { id: string; name?: string; countryCode?: string };
+          participation: { isParticipating: boolean };
+        }>;
+      }>({
+        method: 'GET',
+        path: '/sellers/v1/marketplaceParticipations',
+      });
+      const ids = (res.payload.payload ?? [])
+        .filter((p) => p.participation?.isParticipating !== false)
+        .map((p) => `${p.marketplace.id}${p.marketplace.name ? ` (${p.marketplace.name})` : ''}`);
       checks.push({
         name: 'SP-API marketplace participation',
         status: 'pass',
