@@ -9,7 +9,8 @@
 // late evening; sticking to D-1 avoids partial-day rows).
 //
 // Usage:
-//   npm run ads-ingest                          # yesterday, SP + SD
+//   npm run ads-ingest                          # yesterday, SP + SD, primary region
+//   npm run ads-ingest -- --region NA           # primary-region default, NA override
 //   npm run ads-ingest -- --days 7              # last 7 days, SP + SD
 //   npm run ads-ingest -- --date 2026-05-14     # one specific date
 //   npm run ads-ingest -- --products SP         # SP only
@@ -21,7 +22,11 @@
 // ============================================================================
 
 import { parseArgs } from 'node:util';
-import { loadEnvForAds } from '../lib/env.js';
+import {
+  loadEnvForAdsShared,
+  getAdsApiRegionConfig,
+  type AdsApiRegion,
+} from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
 import { AdsApiClient } from '../lib/ads-api/client.js';
 import { getProfiles } from '../lib/ads-api/profiles.js';
@@ -36,13 +41,19 @@ async function main(): Promise<void> {
       date: { type: 'string' },
       days: { type: 'string' },
       products: { type: 'string' },
+      region: { type: 'string' },
     },
   });
 
-  const env = loadEnvForAds();
-  if (!env.ADS_PROFILE_ID) {
+  const env = loadEnvForAdsShared();
+  const region: AdsApiRegion = (values.region as AdsApiRegion | undefined) ?? env.ADS_API_REGION;
+  if (region !== 'NA' && region !== 'EU' && region !== 'FE') {
+    throw new Error(`--region must be one of: NA, EU, FE. Got "${region}".`);
+  }
+  const config = getAdsApiRegionConfig(region, env);
+  if (!config.profileId) {
     throw new Error(
-      'ADS_PROFILE_ID is not set in .env. Run "npm run ads-probe" to see available profile IDs.',
+      `No Ads profile configured for region ${region}. Run "npm run ads-probe -- --region ${region}" to discover profiles, then set ADS_API_${region}_PROFILE_ID in .env.`,
     );
   }
 
@@ -51,26 +62,27 @@ async function main(): Promise<void> {
 
   console.log('operator-datacore — Amazon Ads ingest');
   console.log('--------------------------------------');
-  console.log(`  Region:        ${env.ADS_API_REGION}`);
-  console.log(`  Profile ID:    ${env.ADS_PROFILE_ID}`);
+  console.log(`  Region:        ${config.region}`);
+  console.log(`  Endpoint:      ${config.endpoint}`);
+  console.log(`  Profile ID:    ${config.profileId}`);
   console.log(`  Products:      ${products.join(', ')}`);
   console.log(`  Dates:         ${dates[0]}${dates.length > 1 ? ` … ${dates[dates.length - 1]} (${dates.length} day${dates.length === 1 ? '' : 's'})` : ''}`);
   console.log('');
 
   const adsClient = new AdsApiClient({
-    region: env.ADS_API_REGION,
+    region: config.region,
     clientId: env.ADS_API_CLIENT_ID,
     clientSecret: env.ADS_API_CLIENT_SECRET,
-    refreshToken: env.ADS_API_REFRESH_TOKEN,
-    profileId: env.ADS_PROFILE_ID,
-    ...(env.ADS_API_ENDPOINT ? { endpoint: env.ADS_API_ENDPOINT } : {}),
+    refreshToken: config.refreshToken,
+    profileId: config.profileId,
+    endpoint: config.endpoint,
   });
 
   const profiles = await getProfiles(adsClient);
-  const profile = profiles.find((p) => String(p.profileId) === String(env.ADS_PROFILE_ID));
+  const profile = profiles.find((p) => String(p.profileId) === String(config.profileId));
   if (!profile) {
     throw new Error(
-      `ADS_PROFILE_ID ${env.ADS_PROFILE_ID} not in /v2/profiles response. Run "npm run ads-probe" to see valid IDs.`,
+      `Profile ${config.profileId} not in /v2/profiles response for region ${region}. Run "npm run ads-probe -- --region ${region}" to see valid IDs.`,
     );
   }
   console.log(`  Account:       ${profile.accountInfo.name} (${profile.countryCode}, ${profile.currencyCode})`);
@@ -96,7 +108,7 @@ async function main(): Promise<void> {
           ingestSpDaily({
             adsClient,
             pg,
-            profileId: env.ADS_PROFILE_ID,
+            profileId: config.profileId,
             startDate: date,
             endDate: date,
             currencyCode: profile.currencyCode,
@@ -109,7 +121,7 @@ async function main(): Promise<void> {
           ingestSdDaily({
             adsClient,
             pg,
-            profileId: env.ADS_PROFILE_ID,
+            profileId: config.profileId,
             startDate: date,
             endDate: date,
             currencyCode: profile.currencyCode,
