@@ -5,34 +5,45 @@
 // and upserts into brain.fba_inventory_snapshot.
 //
 // Usage:
-//   npm run inventory-snapshot
+//   npm run inventory-snapshot                # primary region from .env
+//   npm run inventory-snapshot -- --region na # explicit region override
 // ============================================================================
 
-import { loadEnvForAmazon, getMarketplaceIds } from '../lib/env.js';
+import { parseArgs } from 'node:util';
+import { loadEnvForAmazon, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { snapshotFbaInventory } from '../lib/sp-api/inventory.js';
 
 async function main(): Promise<void> {
+  const { values } = parseArgs({
+    options: {
+      region: { type: 'string' },
+    },
+  });
+
   const env = loadEnvForAmazon();
-  const marketplaceIds = getMarketplaceIds(env);
+  const region: SpApiRegion = (values.region as SpApiRegion | undefined) ?? env.SP_API_REGION;
+  if (region !== 'na' && region !== 'eu' && region !== 'fe') {
+    throw new Error(`--region must be one of: na, eu, fe. Got "${region}".`);
+  }
+  const regionConfig = getSpApiRegionConfig(region, env);
 
   console.log('operator-datacore — FBA inventory snapshot');
   console.log('-------------------------------------------');
-  console.log(`  Region:        ${env.SP_API_REGION}`);
-  console.log(`  Marketplaces:  ${marketplaceIds.join(', ')}`);
+  console.log(`  Region:        ${regionConfig.region}`);
+  console.log(`  Marketplaces:  ${regionConfig.marketplaceIds.join(', ')}`);
   console.log('');
 
   const spClient = new SpApiClient({
-    region: env.SP_API_REGION,
+    region: regionConfig.region,
     clientId: env.SP_API_LWA_CLIENT_ID,
     clientSecret: env.SP_API_LWA_CLIENT_SECRET,
-    refreshToken: env.SP_API_REFRESH_TOKEN,
+    refreshToken: regionConfig.refreshToken,
   });
   const pg = await getPgClient();
 
   try {
-    // 1. Ensure a connection row exists
     const { rows: connRows } = await pg.query<{ connection_id: string }>(
       `INSERT INTO meta.connection (source, label, region, marketplace_ids, status)
        VALUES ('amazon_sp_api', $1, $2, $3, 'active')
@@ -41,13 +52,12 @@ async function main(): Promise<void> {
              last_health_check_at = NOW(), last_health_check_ok = TRUE,
              updated_at = NOW()
        RETURNING connection_id`,
-      [`amazon-${env.SP_API_REGION}`, env.SP_API_REGION, marketplaceIds],
+      [`amazon-${regionConfig.region}`, regionConfig.region, regionConfig.marketplaceIds],
     );
     const connectionId = connRows[0]!.connection_id;
 
-    // 2. Open a sync run (mode='incremental' — meta.sync_run check constraint
-    // accepts backfill | incremental | manual | verification; a daily inventory
-    // snapshot is conceptually one increment of inventory state over time)
+    // mode='incremental' — meta.sync_run check constraint accepts
+    // backfill | incremental | manual | verification.
     const { rows: runRows } = await pg.query<{ sync_run_id: string }>(
       `INSERT INTO meta.sync_run (connection_id, source, object, mode, window_start, window_end)
        VALUES ($1, 'amazon_sp_api', 'fba_inventory_snapshot', 'incremental', NOW(), NOW())
@@ -56,11 +66,10 @@ async function main(): Promise<void> {
     );
     const syncRunId = runRows[0]!.sync_run_id;
 
-    // 3. Run the snapshot per marketplace
     const startedAt = Date.now();
     let totalRows = 0;
 
-    for (const marketplaceId of marketplaceIds) {
+    for (const marketplaceId of regionConfig.marketplaceIds) {
       console.log(`Marketplace ${marketplaceId}:`);
       const result = await snapshotFbaInventory({
         spClient,
@@ -86,7 +95,6 @@ async function main(): Promise<void> {
 
     console.log('');
     console.log(`Done in ${durationSec}s. ${totalRows} SKU snapshots upserted into brain.fba_inventory_snapshot.`);
-    console.log('Next: /sku-audit will now produce a real days-on-hand score; /restock-memo becomes usable.');
   } finally {
     await pg.end();
   }
