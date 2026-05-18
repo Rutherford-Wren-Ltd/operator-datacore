@@ -44,11 +44,18 @@ permissions:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    # Step budget at worst case: S&T ~2 min + rollup <1 min + FBA inventory ~25 min
-    # + Ads SP up to 30 min (Amazon's report queue is slow and unpredictable).
-    # 90 minutes gives meaningful headroom; tighten once we have real workflow
-    # timing data from a few runs.
-    timeout-minutes: 90
+    # Step budget at worst case:
+    #   S&T (EU + NA)           ~5 min
+    #   Rollup                  <1 min
+    #   FBA inventory (both)    ~20 min total after PR #24 non-zero filter
+    #   Ads SP+SD EU multi-profile @ concurrency=2:
+    #     ceil(9/2)=5 batches × ~15 min   = ~75 min  (9 EU profiles)
+    #   Ads SP+SD NA multi-profile @ concurrency=2:
+    #     ceil(3/2)=2 batches × ~15 min   = ~30 min  (3 NA profiles)
+    # Total worst-case: ~135 min. Bumped to 180 to absorb a slow Amazon
+    # report queue day. Concurrency=2 keeps concurrent reports per
+    # batch at 4 (well inside Amazon's typical 5+ per-app limit).
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v6
 
@@ -162,22 +169,33 @@ jobs:
           ADS_API_CLIENT_ID: ${{ secrets.ADS_API_CLIENT_ID }}
           ADS_API_CLIENT_SECRET: ${{ secrets.ADS_API_CLIENT_SECRET }}
           ADS_API_REFRESH_TOKEN: ${{ secrets.ADS_API_REFRESH_TOKEN }}
+          # Plural takes precedence over singular when both are set.
+          # If only the singular ADS_PROFILE_ID is uploaded as a Secret,
+          # the CLI falls back to it (single-profile mode).
           ADS_PROFILE_ID: ${{ secrets.ADS_PROFILE_ID }}
+          ADS_PROFILE_IDS: ${{ secrets.ADS_PROFILE_IDS }}
           ADS_API_REGION: ${{ secrets.ADS_API_REGION }}
           ADS_API_ENDPOINT: ${{ secrets.ADS_API_ENDPOINT }}
         run: |
-          # Sponsored Products + Sponsored Display advertised-product reports
-          # for yesterday. Each report: createReport → poll (~1-10 min) →
-          # gzipped JSON download → upsert into brain.ads_sp_daily /
-          # brain.ads_sd_daily. SP + SD run in parallel. Idempotent for the date.
+          # SP + SD advertised-product reports for yesterday. Each report:
+          # createReport → poll (~1-10 min) → gzipped JSON → upsert into
+          # brain.ads_sp_daily / brain.ads_sd_daily. SP + SD run in parallel
+          # within each (profile, date). Idempotent for the date.
           #
-          # Attribution windows (sales_7d/14d/30d on a given day) keep growing
-          # for up to 30 days as Amazon attributes downstream conversions. We
-          # currently capture each day once at D-1; the 30-day numbers are
-          # therefore as-of-D rather than fully-ripened. Re-pulling older days
-          # to capture ripening is a follow-up (rolling window or a weekly
-          # 30-day re-sync).
-          npm run ads-ingest
+          # --concurrency 2: process 2 profiles in parallel per date.
+          # Effective concurrent reports per batch = 4 (2 profiles × SP+SD),
+          # well inside Amazon's typical 5+ per-app ceiling. If you've
+          # increased your account's Ads API quota, bump to 3.
+          #
+          # If only ADS_PROFILE_ID (singular) is uploaded as a Secret,
+          # the CLI runs single-profile mode and --concurrency 2 simply
+          # means "1 profile in batch 1" — no behaviour change.
+          #
+          # Attribution windows (sales_7d/14d/30d) ripen for up to 30 days
+          # post-click. Daily-sync captures each day at D-1; weekly
+          # attribution-ripen.yml (Sundays 18:00 UTC) refreshes the last
+          # 7 days for both regions.
+          npm run ads-ingest -- --concurrency 2
 
       - name: Pull Ads SP + SD daily (NA)
         env:
@@ -188,10 +206,12 @@ jobs:
           ADS_API_CLIENT_ID: ${{ secrets.ADS_API_CLIENT_ID }}
           ADS_API_CLIENT_SECRET: ${{ secrets.ADS_API_CLIENT_SECRET }}
           ADS_API_NA_REFRESH_TOKEN: ${{ secrets.ADS_API_NA_REFRESH_TOKEN }}
+          # Plural takes precedence; singular is the fallback for
+          # backward-compat. Upload ADS_API_NA_PROFILE_IDS (plural,
+          # comma-separated) to capture all 3 NA profiles.
           ADS_API_NA_PROFILE_ID: ${{ secrets.ADS_API_NA_PROFILE_ID }}
+          ADS_API_NA_PROFILE_IDS: ${{ secrets.ADS_API_NA_PROFILE_IDS }}
         run: |
-          # Same Ads pipeline, NA region. Client ID + Secret are shared
-          # across regions (single LWA app); NA refresh token + profile
-          # ID are NA-specific. Endpoint is derived automatically from
-          # --region (advertising-api.amazon.com for NA).
-          npm run ads-ingest -- --region NA
+          # Same Ads pipeline, NA region, same --concurrency 2 pattern.
+          # 3 NA profiles fit in ceil(3/2)=2 batches × ~15 min = ~30 min.
+          npm run ads-ingest -- --region NA --concurrency 2
