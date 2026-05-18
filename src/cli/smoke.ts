@@ -9,7 +9,8 @@
 //   5. SP-API returns a marketplace list (cheapest possible call)
 // ============================================================================
 
-import { loadEnv, getMarketplaceIds } from '../lib/env.js';
+import { parseArgs } from 'node:util';
+import { loadEnv, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { getLwaAccessToken } from '../lib/sp-api/auth.js';
@@ -21,6 +22,19 @@ interface Check {
 }
 
 async function main(): Promise<void> {
+  const { values } = parseArgs({
+    options: {
+      region: { type: 'string' },
+    },
+  });
+  let regionOverride: SpApiRegion | undefined;
+  if (values.region !== undefined) {
+    if (values.region !== 'na' && values.region !== 'eu' && values.region !== 'fe') {
+      throw new Error(`--region must be one of: na, eu, fe. Got "${values.region}".`);
+    }
+    regionOverride = values.region;
+  }
+
   console.log('operator-datacore — smoke test');
   console.log('-------------------------------\n');
   const checks: Check[] = [];
@@ -66,26 +80,35 @@ async function main(): Promise<void> {
     });
   }
 
-  // 4. SP-API LWA
-  if (env.SP_API_LWA_CLIENT_ID && env.SP_API_LWA_CLIENT_SECRET && env.SP_API_REFRESH_TOKEN) {
+  // 4 + 5. SP-API checks, per region (defaults to primary; --region flag overrides).
+  const region: SpApiRegion = regionOverride ?? env.SP_API_REGION;
+  let regionConfig: ReturnType<typeof getSpApiRegionConfig> | null = null;
+  try {
+    regionConfig = getSpApiRegionConfig(region, env);
+  } catch (err) {
+    checks.push({ name: `SP-API region resolve (${region})`, status: 'skip', detail: (err as Error).message });
+  }
+
+  if (regionConfig && env.SP_API_LWA_CLIENT_ID && env.SP_API_LWA_CLIENT_SECRET) {
+    // 4. LWA
     try {
       const token = await getLwaAccessToken({
         clientId: env.SP_API_LWA_CLIENT_ID,
         clientSecret: env.SP_API_LWA_CLIENT_SECRET,
-        refreshToken: env.SP_API_REFRESH_TOKEN,
+        refreshToken: regionConfig.refreshToken,
       });
-      checks.push({ name: 'SP-API LWA token exchange', status: 'pass', detail: `token len ${token.length}` });
+      checks.push({ name: `SP-API LWA token exchange (${region})`, status: 'pass', detail: `token len ${token.length}` });
     } catch (err) {
-      checks.push({ name: 'SP-API LWA token exchange', status: 'fail', detail: (err as Error).message });
+      checks.push({ name: `SP-API LWA token exchange (${region})`, status: 'fail', detail: (err as Error).message });
     }
 
-    // 5. SP-API marketplaces
+    // 5. marketplaceParticipations — cheapest possible authenticated SP-API call
     try {
       const client = new SpApiClient({
-        region: env.SP_API_REGION,
+        region: regionConfig.region,
         clientId: env.SP_API_LWA_CLIENT_ID,
         clientSecret: env.SP_API_LWA_CLIENT_SECRET,
-        refreshToken: env.SP_API_REFRESH_TOKEN,
+        refreshToken: regionConfig.refreshToken,
       });
       const res = await client.request<{ payload?: { marketplaces?: Array<{ id: string; name?: string }> } }>(
         {
@@ -95,23 +118,25 @@ async function main(): Promise<void> {
       );
       const ids = res.payload.payload?.marketplaces?.map((m) => `${m.id}${m.name ? ` (${m.name})` : ''}`) ?? [];
       checks.push({
-        name: 'SP-API marketplace participation',
+        name: `SP-API marketplace participation (${region})`,
         status: 'pass',
         detail: ids.length ? ids.join(', ') : '(empty)',
       });
     } catch (err) {
-      checks.push({ name: 'SP-API marketplace participation', status: 'fail', detail: (err as Error).message });
+      checks.push({ name: `SP-API marketplace participation (${region})`, status: 'fail', detail: (err as Error).message });
     }
-  } else {
-    checks.push({ name: 'SP-API LWA token exchange', status: 'skip', detail: 'credentials missing in .env' });
+  } else if (!env.SP_API_LWA_CLIENT_ID || !env.SP_API_LWA_CLIENT_SECRET) {
+    checks.push({ name: 'SP-API LWA token exchange', status: 'skip', detail: 'shared LWA credentials missing in .env' });
   }
 
   // Configured marketplaces echo
-  checks.push({
-    name: 'Configured marketplaces (.env)',
-    status: 'pass',
-    detail: getMarketplaceIds(env).join(', '),
-  });
+  if (regionConfig) {
+    checks.push({
+      name: `Configured marketplaces (${region})`,
+      status: 'pass',
+      detail: regionConfig.marketplaceIds.join(', '),
+    });
+  }
 
   print(checks);
   const anyFail = checks.some((c) => c.status === 'fail');
