@@ -42,7 +42,7 @@ async function main(): Promise<void> {
   console.log('-----------------------------------------');
   console.log(`  Region:        ${config.region}`);
   console.log(`  Endpoint:      ${config.endpoint}`);
-  console.log(`  Configured profile: ${config.profileId ?? '(not set)'}`);
+  console.log(`  Configured profiles: ${config.profileIds.length ? config.profileIds.join(', ') : '(not set)'}`);
   console.log('');
 
   const client = new AdsApiClient({
@@ -51,7 +51,7 @@ async function main(): Promise<void> {
     clientSecret: env.ADS_API_CLIENT_SECRET,
     refreshToken: config.refreshToken,
     endpoint: config.endpoint,
-    ...(config.profileId ? { profileId: config.profileId } : {}),
+    ...(config.profileIds[0] ? { profileId: config.profileIds[0] } : {}),
   });
 
   let profiles;
@@ -89,21 +89,31 @@ async function main(): Promise<void> {
     console.log('');
   }
 
-  if (config.profileId) {
-    const configuredId = String(config.profileId);
-    const match = profiles.find((p) => String(p.profileId) === configuredId);
-    if (match) {
-      console.log(`OK — ADS_${config.region === env.ADS_API_REGION ? '' : config.region + '_'}PROFILE_ID (${configuredId}) matches "${match.accountInfo.name}".`);
-    } else {
-      console.error(`WARNING — configured profile (${configuredId}) is not in the returned list for region ${config.region}.`);
-      console.error('         The API call worked, but the configured profile is wrong for this region.');
-      console.error('         Pick one of the profileIds above and update .env.');
+  if (config.profileIds.length > 0) {
+    const returnedIds = new Set(profiles.map((p) => String(p.profileId)));
+    const matched: string[] = [];
+    const missing: string[] = [];
+    for (const id of config.profileIds) {
+      if (returnedIds.has(String(id))) matched.push(id);
+      else missing.push(id);
+    }
+    for (const id of matched) {
+      const p = profiles.find((q) => String(q.profileId) === String(id))!;
+      console.log(`OK — profile ${id} matches "${p.accountInfo.name}" (${p.countryCode}, ${p.currencyCode}).`);
+    }
+    if (missing.length > 0) {
+      for (const id of missing) {
+        console.error(`WARNING — configured profile ${id} is not in the returned list for region ${config.region}.`);
+      }
+      console.error(`         ${missing.length} of ${config.profileIds.length} configured profile(s) did not match.`);
+      console.error('         Either remove them from .env or replace with profileIds from the list above.');
       process.exit(1);
     }
   } else {
-    console.log(`NOTE — no profile configured for region ${config.region}. Pick one of the profileIds above`);
-    console.log(`       and add it to .env as ADS_API_${config.region}_PROFILE_ID`);
-    console.log(`       (or as ADS_PROFILE_ID if this is your primary region).`);
+    console.log(`NOTE — no profile configured for region ${config.region}. Pick one or more profileIds above`);
+    console.log(`       and add to .env as ADS_API_${config.region}_PROFILE_ID (single) or`);
+    console.log(`       ADS_API_${config.region}_PROFILE_IDS (comma-separated, multiple).`);
+    console.log(`       (For the primary region, ADS_PROFILE_ID / ADS_PROFILE_IDS also work as legacy fallbacks.)`);
   }
 
   console.log('');

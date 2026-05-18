@@ -51,9 +51,9 @@ async function main(): Promise<void> {
     throw new Error(`--region must be one of: NA, EU, FE. Got "${region}".`);
   }
   const config = getAdsApiRegionConfig(region, env);
-  if (!config.profileId) {
+  if (config.profileIds.length === 0) {
     throw new Error(
-      `No Ads profile configured for region ${region}. Run "npm run ads-probe -- --region ${region}" to discover profiles, then set ADS_API_${region}_PROFILE_ID in .env.`,
+      `No Ads profile(s) configured for region ${region}. Run "npm run ads-probe -- --region ${region}" to discover, then set ADS_API_${region}_PROFILE_ID (single) or ADS_API_${region}_PROFILE_IDS (comma-separated) in .env.`,
     );
   }
 
@@ -64,29 +64,30 @@ async function main(): Promise<void> {
   console.log('--------------------------------------');
   console.log(`  Region:        ${config.region}`);
   console.log(`  Endpoint:      ${config.endpoint}`);
-  console.log(`  Profile ID:    ${config.profileId}`);
+  console.log(`  Profile(s):    ${config.profileIds.join(', ')} (${config.profileIds.length} profile${config.profileIds.length === 1 ? '' : 's'})`);
   console.log(`  Products:      ${products.join(', ')}`);
   console.log(`  Dates:         ${dates[0]}${dates.length > 1 ? ` … ${dates[dates.length - 1]} (${dates.length} day${dates.length === 1 ? '' : 's'})` : ''}`);
   console.log('');
 
-  const adsClient = new AdsApiClient({
+  // Initial client used for the /v2/profiles enumeration. Per-profile
+  // clients with their scope set are created inside the loop below.
+  const discoveryClient = new AdsApiClient({
     region: config.region,
     clientId: env.ADS_API_CLIENT_ID,
     clientSecret: env.ADS_API_CLIENT_SECRET,
     refreshToken: config.refreshToken,
-    profileId: config.profileId,
     endpoint: config.endpoint,
   });
-
-  const profiles = await getProfiles(adsClient);
-  const profile = profiles.find((p) => String(p.profileId) === String(config.profileId));
-  if (!profile) {
+  const allProfiles = await getProfiles(discoveryClient);
+  const matchedProfiles = config.profileIds
+    .map((id) => allProfiles.find((p) => String(p.profileId) === String(id)))
+    .filter((p): p is NonNullable<typeof p> => p !== undefined);
+  if (matchedProfiles.length !== config.profileIds.length) {
+    const missing = config.profileIds.filter((id) => !allProfiles.some((p) => String(p.profileId) === String(id)));
     throw new Error(
-      `Profile ${config.profileId} not in /v2/profiles response for region ${region}. Run "npm run ads-probe -- --region ${region}" to see valid IDs.`,
+      `Profile(s) ${missing.join(', ')} not in /v2/profiles response for region ${region}. Run "npm run ads-probe -- --region ${region}" to see valid IDs.`,
     );
   }
-  console.log(`  Account:       ${profile.accountInfo.name} (${profile.countryCode}, ${profile.currencyCode})`);
-  console.log('');
 
   const pg = await getPgClient();
 
@@ -94,51 +95,68 @@ async function main(): Promise<void> {
     const startedAt = Date.now();
     const totals: Record<AdProductKey, number> = { SP: 0, SD: 0 };
 
-    for (const date of dates) {
-      console.log(`Date ${date}:`);
-      const pollLogger = (label: string) => ({
-        onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
-          console.log(`  [${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s elapsed)`);
-        },
-      });
+    // Profiles processed sequentially. SP + SD within a profile run in
+    // parallel (already supported). Profile-level parallelism is a
+    // follow-up — Amazon's concurrent-report limits are per-LWA-app
+    // across all profiles, so naive parallelism risks 429s.
+    for (const profile of matchedProfiles) {
+      console.log(`Profile ${profile.profileId} — ${profile.accountInfo.name} (${profile.countryCode}, ${profile.currencyCode})`);
 
-      const jobs: Array<Promise<{ product: AdProductKey; rows: number; reportId: string }>> = [];
-      if (products.includes('SP')) {
-        jobs.push(
-          ingestSpDaily({
-            adsClient,
-            pg,
-            profileId: config.profileId,
-            startDate: date,
-            endDate: date,
-            currencyCode: profile.currencyCode,
-            poll: pollLogger('SP'),
-          }).then((r) => ({ product: 'SP' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
-        );
-      }
-      if (products.includes('SD')) {
-        jobs.push(
-          ingestSdDaily({
-            adsClient,
-            pg,
-            profileId: config.profileId,
-            startDate: date,
-            endDate: date,
-            currencyCode: profile.currencyCode,
-            poll: pollLogger('SD'),
-          }).then((r) => ({ product: 'SD' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
-        );
-      }
+      for (const date of dates) {
+        console.log(`  Date ${date}:`);
+        const pollLogger = (label: string) => ({
+          onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
+            console.log(`    [${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s elapsed)`);
+          },
+        });
 
-      const results = await Promise.all(jobs);
-      for (const r of results) {
-        console.log(`  [${r.product}] done: ${r.rows} row(s) upserted (reportId ${r.reportId})`);
-        totals[r.product] += r.rows;
+        const scopedClient = new AdsApiClient({
+          region: config.region,
+          clientId: env.ADS_API_CLIENT_ID,
+          clientSecret: env.ADS_API_CLIENT_SECRET,
+          refreshToken: config.refreshToken,
+          endpoint: config.endpoint,
+          profileId: String(profile.profileId),
+        });
+
+        const jobs: Array<Promise<{ product: AdProductKey; rows: number; reportId: string }>> = [];
+        if (products.includes('SP')) {
+          jobs.push(
+            ingestSpDaily({
+              adsClient: scopedClient,
+              pg,
+              profileId: String(profile.profileId),
+              startDate: date,
+              endDate: date,
+              currencyCode: profile.currencyCode,
+              poll: pollLogger('SP'),
+            }).then((r) => ({ product: 'SP' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
+          );
+        }
+        if (products.includes('SD')) {
+          jobs.push(
+            ingestSdDaily({
+              adsClient: scopedClient,
+              pg,
+              profileId: String(profile.profileId),
+              startDate: date,
+              endDate: date,
+              currencyCode: profile.currencyCode,
+              poll: pollLogger('SD'),
+            }).then((r) => ({ product: 'SD' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
+          );
+        }
+
+        const results = await Promise.all(jobs);
+        for (const r of results) {
+          console.log(`    [${r.product}] done: ${r.rows} row(s) upserted (reportId ${r.reportId})`);
+          totals[r.product] += r.rows;
+        }
       }
+      console.log('');
     }
 
     const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-    console.log('');
     console.log(`Done in ${durationSec}s.`);
     for (const p of products) {
       console.log(`  ${p}: ${totals[p]} row(s) total → brain.ads_${p.toLowerCase()}_daily`);

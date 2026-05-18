@@ -93,13 +93,24 @@ const Schema = z.object({
   ADS_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
   ADS_API_REGION: emptyToUndef(z.enum(['NA', 'EU', 'FE']).default('EU')),
   ADS_API_ENDPOINT: emptyToUndef(z.string().url().optional()),
-  // Additional Ads regions (optional).
+  // Additional Ads regions (optional). Per region, set EITHER:
+  //   - _PROFILE_ID (singular) — one profile only, or
+  //   - _PROFILE_IDS (plural, comma-separated) — multiple profiles in
+  //     the same region under the same refresh token (Amazon's
+  //     /v2/profiles enumerates all profiles a single seller can see).
+  // Plural takes precedence over singular when both are set.
   ADS_API_NA_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
   ADS_API_NA_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_NA_PROFILE_IDS: emptyToUndef(z.string().min(1).optional()),
   ADS_API_EU_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
   ADS_API_EU_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_EU_PROFILE_IDS: emptyToUndef(z.string().min(1).optional()),
   ADS_API_FE_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
   ADS_API_FE_PROFILE_ID: emptyToUndef(z.string().min(1).optional()),
+  ADS_API_FE_PROFILE_IDS: emptyToUndef(z.string().min(1).optional()),
+  // Primary-region multi-profile (legacy single ADS_PROFILE_ID still
+  // honoured as a fallback).
+  ADS_PROFILE_IDS: emptyToUndef(z.string().min(1).optional()),
 
   // Behaviour
   BACKFILL_MONTHS: z.coerce.number().int().min(1).max(36).default(24),
@@ -318,9 +329,9 @@ const ADS_API_DEFAULT_ENDPOINTS: Record<AdsApiRegion, string> = {
 export interface AdsApiRegionConfig {
   region: AdsApiRegion;
   refreshToken: string;
-  /** May be undefined when the operator hasn't pinned a profile yet — the
-   *  probe lists all profiles in that case. Required for any scoped call. */
-  profileId?: string;
+  /** All profile IDs configured for this region. Empty array if none
+   *  configured yet (probe-only use case — operator hasn't pinned one yet). */
+  profileIds: string[];
   endpoint: string;
 }
 
@@ -341,18 +352,19 @@ export function getAdsApiRegionConfig(region: AdsApiRegion, env: Env = loadEnv()
     region === 'NA' ? env.ADS_API_NA_REFRESH_TOKEN
     : region === 'EU' ? env.ADS_API_EU_REFRESH_TOKEN
     : env.ADS_API_FE_REFRESH_TOKEN;
-  const prefixedProfile =
+  const prefixedProfileId =
     region === 'NA' ? env.ADS_API_NA_PROFILE_ID
     : region === 'EU' ? env.ADS_API_EU_PROFILE_ID
     : env.ADS_API_FE_PROFILE_ID;
+  const prefixedProfileIds =
+    region === 'NA' ? env.ADS_API_NA_PROFILE_IDS
+    : region === 'EU' ? env.ADS_API_EU_PROFILE_IDS
+    : env.ADS_API_FE_PROFILE_IDS;
 
   const isPrimary = env.ADS_API_REGION === region;
 
   let refreshToken: string | undefined = prefixedToken;
   if (!refreshToken && isPrimary) refreshToken = env.ADS_API_REFRESH_TOKEN;
-
-  let profileId: string | undefined = prefixedProfile;
-  if (!profileId && isPrimary) profileId = env.ADS_PROFILE_ID;
 
   if (!refreshToken) {
     throw new Error(
@@ -360,6 +372,21 @@ export function getAdsApiRegionConfig(region: AdsApiRegion, env: Env = loadEnv()
       `Set ADS_API_${region}_REFRESH_TOKEN in .env ` +
       `(or, if this is your primary region, set ADS_API_REFRESH_TOKEN and ADS_API_REGION=${region}).`,
     );
+  }
+
+  // Profile resolution: plural _IDS takes precedence; fall back to
+  // singular _ID; for the primary region, also honour the legacy
+  // ADS_PROFILE_IDS / ADS_PROFILE_ID as fallbacks. Empty array if none
+  // configured (probe-only use case — operator hasn't pinned one yet).
+  let profileIds: string[] = [];
+  let csv: string | undefined = prefixedProfileIds;
+  if (!csv && isPrimary) csv = env.ADS_PROFILE_IDS;
+  if (csv) {
+    profileIds = csv.split(',').map((s: string) => s.trim()).filter(Boolean);
+  } else {
+    let single: string | undefined = prefixedProfileId;
+    if (!single && isPrimary) single = env.ADS_PROFILE_ID;
+    if (single) profileIds = [single];
   }
 
   // ADS_API_ENDPOINT is a manual override but it is region-specific (e.g.
@@ -371,11 +398,10 @@ export function getAdsApiRegionConfig(region: AdsApiRegion, env: Env = loadEnv()
   let endpoint = ADS_API_DEFAULT_ENDPOINTS[region];
   if (isPrimary && env.ADS_API_ENDPOINT) endpoint = env.ADS_API_ENDPOINT;
 
-  const config: AdsApiRegionConfig = {
+  return {
     region,
     refreshToken,
+    profileIds,
     endpoint,
   };
-  if (profileId) config.profileId = profileId;
-  return config;
 }
