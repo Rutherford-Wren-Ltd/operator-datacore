@@ -362,10 +362,19 @@ export function getAdsApiRegionConfig(region: AdsApiRegion, env: Env = loadEnv()
     );
   }
 
+  // ADS_API_ENDPOINT is a manual override but it is region-specific (e.g.
+  // https://advertising-api-eu.amazon.com is the EU URL). Honour it only
+  // when the requested region matches the primary; for other regions, use
+  // the canonical per-region default. Without this gate, a primary=EU
+  // operator's override would route NA / FE calls to the EU endpoint and
+  // silently return the wrong region's data.
+  let endpoint = ADS_API_DEFAULT_ENDPOINTS[region];
+  if (isPrimary && env.ADS_API_ENDPOINT) endpoint = env.ADS_API_ENDPOINT;
+
   const config: AdsApiRegionConfig = {
     region,
     refreshToken,
-    endpoint: env.ADS_API_ENDPOINT ?? ADS_API_DEFAULT_ENDPOINTS[region],
+    endpoint,
   };
   if (profileId) config.profileId = profileId;
   return config;
