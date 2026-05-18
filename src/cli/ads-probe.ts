@@ -7,32 +7,51 @@
 //   - LWA Client ID + Secret are valid (token exchange succeeds)
 //   - Refresh token is valid (not expired, not revoked)
 //   - The Ads API access role is actually granted on the LWA app
-//   - The Profile ID in .env matches a profile this account can access
+//   - The configured profile ID (if any) matches a profile this account
+//     can access in the chosen region
 //
 // Usage:
-//   npm run ads-probe
+//   npm run ads-probe                  # primary region from ADS_API_REGION
+//   npm run ads-probe -- --region NA   # explicit region override (NA|EU|FE)
 // ============================================================================
 
-import { loadEnvForAds } from '../lib/env.js';
+import { parseArgs } from 'node:util';
+import {
+  loadEnvForAdsShared,
+  getAdsApiRegionConfig,
+  type AdsApiRegion,
+} from '../lib/env.js';
 import { AdsApiClient, AdsApiError } from '../lib/ads-api/client.js';
 import { getProfiles } from '../lib/ads-api/profiles.js';
 
 async function main(): Promise<void> {
-  const env = loadEnvForAds();
+  const { values } = parseArgs({
+    options: {
+      region: { type: 'string' },
+    },
+  });
+
+  const env = loadEnvForAdsShared();
+  const region: AdsApiRegion = (values.region as AdsApiRegion | undefined) ?? env.ADS_API_REGION;
+  if (region !== 'NA' && region !== 'EU' && region !== 'FE') {
+    throw new Error(`--region must be one of: NA, EU, FE. Got "${region}".`);
+  }
+  const config = getAdsApiRegionConfig(region, env);
 
   console.log('operator-datacore — Amazon Ads API probe');
   console.log('-----------------------------------------');
-  console.log(`  Region:        ${env.ADS_API_REGION}`);
-  console.log(`  Endpoint:      ${env.ADS_API_ENDPOINT ?? '(derived from region)'}`);
-  console.log(`  Configured profile: ${env.ADS_PROFILE_ID ?? '(not set)'}`);
+  console.log(`  Region:        ${config.region}`);
+  console.log(`  Endpoint:      ${config.endpoint}`);
+  console.log(`  Configured profile: ${config.profileId ?? '(not set)'}`);
   console.log('');
 
   const client = new AdsApiClient({
-    region: env.ADS_API_REGION,
+    region: config.region,
     clientId: env.ADS_API_CLIENT_ID,
     clientSecret: env.ADS_API_CLIENT_SECRET,
-    refreshToken: env.ADS_API_REFRESH_TOKEN,
-    ...(env.ADS_API_ENDPOINT ? { endpoint: env.ADS_API_ENDPOINT } : {}),
+    refreshToken: config.refreshToken,
+    endpoint: config.endpoint,
+    ...(config.profileId ? { profileId: config.profileId } : {}),
   });
 
   let profiles;
@@ -70,23 +89,25 @@ async function main(): Promise<void> {
     console.log('');
   }
 
-  if (env.ADS_PROFILE_ID) {
-    const configuredId = String(env.ADS_PROFILE_ID);
+  if (config.profileId) {
+    const configuredId = String(config.profileId);
     const match = profiles.find((p) => String(p.profileId) === configuredId);
     if (match) {
-      console.log(`OK — ADS_PROFILE_ID (${configuredId}) matches "${match.accountInfo.name}".`);
+      console.log(`OK — ADS_${config.region === env.ADS_API_REGION ? '' : config.region + '_'}PROFILE_ID (${configuredId}) matches "${match.accountInfo.name}".`);
     } else {
-      console.error(`WARNING — ADS_PROFILE_ID (${configuredId}) is not in the returned list.`);
-      console.error('         The API call worked, but the configured profile is wrong.');
+      console.error(`WARNING — configured profile (${configuredId}) is not in the returned list for region ${config.region}.`);
+      console.error('         The API call worked, but the configured profile is wrong for this region.');
       console.error('         Pick one of the profileIds above and update .env.');
       process.exit(1);
     }
   } else {
-    console.log('NOTE — ADS_PROFILE_ID is not set. Pick one of the profileIds above and add it to .env.');
+    console.log(`NOTE — no profile configured for region ${config.region}. Pick one of the profileIds above`);
+    console.log(`       and add it to .env as ADS_API_${config.region}_PROFILE_ID`);
+    console.log(`       (or as ADS_PROFILE_ID if this is your primary region).`);
   }
 
   console.log('');
-  console.log('Probe passed. Credentials are good. Safe to build the SP/SB/SD report ingest libs.');
+  console.log(`Probe passed for region ${config.region}. Credentials are good.`);
 }
 
 main().catch((err) => {
