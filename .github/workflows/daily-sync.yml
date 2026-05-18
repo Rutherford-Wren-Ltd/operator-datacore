@@ -60,7 +60,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Pull Sales & Traffic
+      - name: Pull Sales & Traffic (primary region — EU)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -77,6 +77,27 @@ jobs:
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} (concurrency 1, 8s delay between days)"
           npm run backfill -- --source amazon --report sales-traffic \
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
+
+      - name: Pull Sales & Traffic (NA)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+          SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
+        run: |
+          # Same code path as the primary-region pull, just with --region na.
+          # Falls back to the per-region default marketplace (US = ATVPDKIKX0DER)
+          # if SP_API_NA_MARKETPLACE_IDS is not set.
+          DAYS="${{ github.event.inputs.days || '3' }}"
+          FROM=$(date -u -d "${DAYS} days ago" +%F)
+          TO=$(date -u -d "yesterday" +%F)
+          echo "Pulling Sales & Traffic ${FROM} → ${TO} for NA region"
+          npm run backfill -- --source amazon --report sales-traffic --region na \
             --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
 
       - name: Roll up rollups
@@ -102,7 +123,7 @@ jobs:
             });
           "
 
-      - name: Pull FBA inventory snapshot
+      - name: Pull FBA inventory snapshot (primary region — EU)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -119,6 +140,18 @@ jobs:
           # the Sales & Traffic pull above consumes. Idempotent for the day:
           # re-running replaces the day's rows.
           npm run inventory-snapshot
+
+      - name: Pull FBA inventory snapshot (NA)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+          SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
+        run: npm run inventory-snapshot -- --region na
 
       - name: Pull Ads SP + SD daily (D-1)
         env:

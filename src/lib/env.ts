@@ -63,11 +63,23 @@ const Schema = z.object({
   SUPABASE_DB_URL: z.string().url(),
 
   // Amazon SP-API
+  // Single LWA app, region-specific refresh tokens. SP_API_REFRESH_TOKEN +
+  // SP_API_REGION + SP_API_MARKETPLACE_IDS are the legacy single-region
+  // form (treated as the "primary" region). To pull a second region in the
+  // same daily-sync, set SP_API_NA_REFRESH_TOKEN + SP_API_NA_MARKETPLACE_IDS
+  // (or SP_API_EU_*, SP_API_FE_*). The Client ID + Secret are shared.
   SP_API_LWA_CLIENT_ID: z.string().min(1).optional(),
   SP_API_LWA_CLIENT_SECRET: z.string().min(1).optional(),
   SP_API_REFRESH_TOKEN: z.string().min(1).optional(),
   SP_API_REGION: z.enum(['na', 'eu', 'fe']).default('na'),
   SP_API_MARKETPLACE_IDS: z.string().default('ATVPDKIKX0DER'),
+  // Additional regions (optional).
+  SP_API_NA_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  SP_API_NA_MARKETPLACE_IDS: emptyToUndef(z.string().optional()),
+  SP_API_EU_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  SP_API_EU_MARKETPLACE_IDS: emptyToUndef(z.string().optional()),
+  SP_API_FE_REFRESH_TOKEN: emptyToUndef(z.string().min(1).optional()),
+  SP_API_FE_MARKETPLACE_IDS: emptyToUndef(z.string().optional()),
 
   // Amazon Ads API (separate LWA app from SP-API above)
   ADS_API_CLIENT_ID: emptyToUndef(z.string().min(1).optional()),
@@ -137,6 +149,78 @@ export function loadEnvForAmazon(): Env & {
     SP_API_LWA_CLIENT_SECRET: string;
     SP_API_REFRESH_TOKEN: string;
   };
+}
+
+export type SpApiRegion = 'na' | 'eu' | 'fe';
+
+export interface SpApiRegionConfig {
+  region: SpApiRegion;
+  refreshToken: string;
+  marketplaceIds: string[];
+}
+
+/**
+ * Resolve SP-API credentials for a specific region.
+ *
+ * Lookup order:
+ *   1. Region-prefixed vars (e.g. SP_API_NA_REFRESH_TOKEN, SP_API_NA_MARKETPLACE_IDS).
+ *   2. If the requested region matches SP_API_REGION (the "primary"), fall
+ *      back to the legacy un-prefixed SP_API_REFRESH_TOKEN / SP_API_MARKETPLACE_IDS.
+ *
+ * Throws if no refresh token can be resolved for the region. Marketplace IDs
+ * fall back to per-region defaults if neither prefixed nor legacy var is set.
+ */
+export function getSpApiRegionConfig(region: SpApiRegion, env: Env = loadEnv()): SpApiRegionConfig {
+  // Map region to the prefixed env keys.
+  const prefixedToken =
+    region === 'na' ? env.SP_API_NA_REFRESH_TOKEN
+    : region === 'eu' ? env.SP_API_EU_REFRESH_TOKEN
+    : env.SP_API_FE_REFRESH_TOKEN;
+  const prefixedMarkets =
+    region === 'na' ? env.SP_API_NA_MARKETPLACE_IDS
+    : region === 'eu' ? env.SP_API_EU_MARKETPLACE_IDS
+    : env.SP_API_FE_MARKETPLACE_IDS;
+
+  // Per-region default marketplace (most common single-marketplace seller
+  // case) if nothing is configured. Operator can override via env.
+  const defaultMarket =
+    region === 'na' ? 'ATVPDKIKX0DER'   // US
+    : region === 'eu' ? 'A1F83G8C2ARO7P' // UK
+    : 'A1VC38T7YXB528';                  // JP
+
+  const isPrimary = env.SP_API_REGION === region;
+  const refreshToken = prefixedToken ?? (isPrimary ? env.SP_API_REFRESH_TOKEN : undefined);
+  let marketsCsv: string = defaultMarket;
+  if (prefixedMarkets) marketsCsv = prefixedMarkets;
+  else if (isPrimary) marketsCsv = env.SP_API_MARKETPLACE_IDS;
+
+  if (!refreshToken) {
+    throw new Error(
+      `SP-API refresh token not configured for region '${region}'. ` +
+      `Set SP_API_${region.toUpperCase()}_REFRESH_TOKEN in .env ` +
+      `(or, if this is your primary region, set SP_API_REFRESH_TOKEN and SP_API_REGION=${region}).`,
+    );
+  }
+
+  return {
+    region,
+    refreshToken,
+    marketplaceIds: marketsCsv.split(',').map((s) => s.trim()).filter(Boolean),
+  };
+}
+
+/**
+ * Enumerate every region that has SP-API credentials configured. Used by the
+ * daily-sync flow to decide whether to ingest one region or two.
+ */
+export function getConfiguredSpApiRegions(env: Env = loadEnv()): SpApiRegion[] {
+  const regions = new Set<SpApiRegion>();
+  // Primary region (legacy form)
+  if (env.SP_API_REFRESH_TOKEN) regions.add(env.SP_API_REGION);
+  if (env.SP_API_NA_REFRESH_TOKEN) regions.add('na');
+  if (env.SP_API_EU_REFRESH_TOKEN) regions.add('eu');
+  if (env.SP_API_FE_REFRESH_TOKEN) regions.add('fe');
+  return Array.from(regions);
 }
 
 export function getMarketplaceIds(env: Env = loadEnv()): string[] {

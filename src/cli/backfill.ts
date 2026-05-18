@@ -16,7 +16,7 @@
 // ============================================================================
 
 import { parseArgs } from 'node:util';
-import { loadEnvForAmazon, getMarketplaceIds } from '../lib/env.js';
+import { loadEnvForAmazon, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { backfillSalesTraffic } from '../lib/sp-api/sales-traffic.js';
@@ -29,6 +29,7 @@ interface ParsedArgs {
   to: Date | null;
   concurrency: number;
   delayMs: number;
+  region: SpApiRegion | null;
 }
 
 function parseCliArgs(): ParsedArgs {
@@ -41,6 +42,7 @@ function parseCliArgs(): ParsedArgs {
       to: { type: 'string' },
       concurrency: { type: 'string', default: '3' },
       delay: { type: 'string', default: '2000' },
+      region: { type: 'string' },
     },
   });
 
@@ -49,8 +51,15 @@ function parseCliArgs(): ParsedArgs {
   const to = values.to ? new Date(values.to + 'T23:59:59Z') : null;
   const concurrency = parseInt(values.concurrency!, 10);
   const delayMs = parseInt(values.delay!, 10);
+  let region: SpApiRegion | null = null;
+  if (values.region !== undefined) {
+    if (values.region !== 'na' && values.region !== 'eu' && values.region !== 'fe') {
+      throw new Error(`--region must be one of: na, eu, fe. Got "${values.region}".`);
+    }
+    region = values.region;
+  }
 
-  return { source: values.source!, report: values.report!, months, from, to, concurrency, delayMs };
+  return { source: values.source!, report: values.report!, months, from, to, concurrency, delayMs, region };
 }
 
 async function main(): Promise<void> {
@@ -66,7 +75,9 @@ async function main(): Promise<void> {
   }
 
   const env = loadEnvForAmazon();
-  const marketplaceIds = getMarketplaceIds(env);
+  const region: SpApiRegion = args.region ?? env.SP_API_REGION;
+  const regionConfig = getSpApiRegionConfig(region, env);
+  const marketplaceIds = regionConfig.marketplaceIds;
 
   // Window: --from/--to take precedence over --months
   let fromDate: Date;
@@ -84,7 +95,7 @@ async function main(): Promise<void> {
 
   console.log('operator-datacore — Sales & Traffic backfill');
   console.log('---------------------------------------------');
-  console.log(`  Region:        ${env.SP_API_REGION}`);
+  console.log(`  Region:        ${regionConfig.region}`);
   console.log(`  Marketplaces:  ${marketplaceIds.join(', ')}`);
   console.log(`  Window:        ${fromDate.toISOString().slice(0, 10)} → ${toDate.toISOString().slice(0, 10)}`);
   console.log(`  Concurrency:   ${args.concurrency}`);
@@ -92,10 +103,10 @@ async function main(): Promise<void> {
   console.log('');
 
   const spClient = new SpApiClient({
-    region: env.SP_API_REGION,
+    region: regionConfig.region,
     clientId: env.SP_API_LWA_CLIENT_ID,
     clientSecret: env.SP_API_LWA_CLIENT_SECRET,
-    refreshToken: env.SP_API_REFRESH_TOKEN,
+    refreshToken: regionConfig.refreshToken,
   });
   const pg = await getPgClient();
 
@@ -109,7 +120,7 @@ async function main(): Promise<void> {
              last_health_check_at = NOW(), last_health_check_ok = TRUE,
              updated_at = NOW()
        RETURNING connection_id`,
-      [`amazon-${env.SP_API_REGION}`, env.SP_API_REGION, marketplaceIds],
+      [`amazon-${regionConfig.region}`, regionConfig.region, marketplaceIds],
     );
     const connectionId = connRows[0]!.connection_id;
 
