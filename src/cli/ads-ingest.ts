@@ -9,16 +9,27 @@
 // late evening; sticking to D-1 avoids partial-day rows).
 //
 // Usage:
-//   npm run ads-ingest                          # yesterday, SP + SD, primary region
-//   npm run ads-ingest -- --region NA           # primary-region default, NA override
-//   npm run ads-ingest -- --days 7              # last 7 days, SP + SD
-//   npm run ads-ingest -- --date 2026-05-14     # one specific date
-//   npm run ads-ingest -- --products SP         # SP only
-//   npm run ads-ingest -- --products SD         # SD only
+//   npm run ads-ingest                            # yesterday, SP + SD, primary region
+//   npm run ads-ingest -- --region NA             # primary-region default, NA override
+//   npm run ads-ingest -- --days 7                # last 7 days, SP + SD
+//   npm run ads-ingest -- --date 2026-05-14       # one specific date
+//   npm run ads-ingest -- --products SP           # SP only
+//   npm run ads-ingest -- --products SD           # SD only
+//   npm run ads-ingest -- --concurrency 3         # 3 profiles in parallel per date (default 1)
 //
-// SP and SD reports for the same date are kicked off in parallel — each
-// spends 5-15 min waiting on Amazon's report queue, and they sit on
-// separate quota buckets, so running concurrently roughly halves wall time.
+// Concurrency:
+//   - SP + SD for one (profile, date) always run in parallel — separate
+//     report types, separate quota buckets on Amazon's side.
+//   - Across profiles, the default is sequential (--concurrency 1) because
+//     Amazon's createReport rate limits and concurrent-report ceilings
+//     are PER LWA APP, not per profile. Running 9 profiles' worth of
+//     reports at once = up to 18 concurrent reports per app, which risks
+//     429s on most accounts.
+//   - --concurrency 2-3 is usually safe for accounts that have been on
+//     the Ads API for a while. New apps with default quotas should stay
+//     at 1 until they have usage history.
+//   - Within each batch of N profiles, SP+SD still run in parallel —
+//     effective concurrency is 2N concurrent reports.
 // ============================================================================
 
 import { parseArgs } from 'node:util';
@@ -28,12 +39,19 @@ import {
   type AdsApiRegion,
 } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
+import type { Client as PgClient } from 'pg';
 import { AdsApiClient } from '../lib/ads-api/client.js';
-import { getProfiles } from '../lib/ads-api/profiles.js';
+import { getProfiles, type AdsProfile } from '../lib/ads-api/profiles.js';
 import { ingestSpDaily } from '../lib/ads-api/sp-ingest.js';
 import { ingestSdDaily } from '../lib/ads-api/sd-ingest.js';
 
 type AdProductKey = 'SP' | 'SD';
+
+interface ProfileDateResult {
+  profile: AdsProfile;
+  date: string;
+  byProduct: Record<AdProductKey, { rows: number; reportId: string } | undefined>;
+}
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -42,6 +60,7 @@ async function main(): Promise<void> {
       days: { type: 'string' },
       products: { type: 'string' },
       region: { type: 'string' },
+      concurrency: { type: 'string' },
     },
   });
 
@@ -59,6 +78,7 @@ async function main(): Promise<void> {
 
   const dates = resolveDates(values.date, values.days);
   const products = resolveProducts(values.products);
+  const concurrency = resolveConcurrency(values.concurrency);
 
   console.log('operator-datacore — Amazon Ads ingest');
   console.log('--------------------------------------');
@@ -67,6 +87,7 @@ async function main(): Promise<void> {
   console.log(`  Profile(s):    ${config.profileIds.join(', ')} (${config.profileIds.length} profile${config.profileIds.length === 1 ? '' : 's'})`);
   console.log(`  Products:      ${products.join(', ')}`);
   console.log(`  Dates:         ${dates[0]}${dates.length > 1 ? ` … ${dates[dates.length - 1]} (${dates.length} day${dates.length === 1 ? '' : 's'})` : ''}`);
+  console.log(`  Concurrency:   ${concurrency} profile${concurrency === 1 ? '' : 's'} in parallel per date`);
   console.log('');
 
   // Initial client used for the /v2/profiles enumeration. Per-profile
@@ -95,62 +116,41 @@ async function main(): Promise<void> {
     const startedAt = Date.now();
     const totals: Record<AdProductKey, number> = { SP: 0, SD: 0 };
 
-    // Profiles processed sequentially. SP + SD within a profile run in
-    // parallel (already supported). Profile-level parallelism is a
-    // follow-up — Amazon's concurrent-report limits are per-LWA-app
-    // across all profiles, so naive parallelism risks 429s.
-    for (const profile of matchedProfiles) {
-      console.log(`Profile ${profile.profileId} — ${profile.accountInfo.name} (${profile.countryCode}, ${profile.currencyCode})`);
+    // For each date, batch profiles into groups of `concurrency` and run
+    // each batch in parallel. Within each batched profile, SP + SD still
+    // run in parallel — effective concurrent reports per batch is 2 × N.
+    for (const date of dates) {
+      console.log(`Date ${date}:`);
 
-      for (const date of dates) {
-        console.log(`  Date ${date}:`);
-        const pollLogger = (label: string) => ({
-          onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
-            console.log(`    [${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s elapsed)`);
-          },
-        });
+      for (let i = 0; i < matchedProfiles.length; i += concurrency) {
+        const batch = matchedProfiles.slice(i, i + concurrency);
+        const batchLabel = matchedProfiles.length > concurrency
+          ? `  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(matchedProfiles.length / concurrency)}: ${batch.length} profile${batch.length === 1 ? '' : 's'} in parallel`
+          : null;
+        if (batchLabel) console.log(batchLabel);
 
-        const scopedClient = new AdsApiClient({
-          region: config.region,
-          clientId: env.ADS_API_CLIENT_ID,
-          clientSecret: env.ADS_API_CLIENT_SECRET,
-          refreshToken: config.refreshToken,
-          endpoint: config.endpoint,
-          profileId: String(profile.profileId),
-        });
-
-        const jobs: Array<Promise<{ product: AdProductKey; rows: number; reportId: string }>> = [];
-        if (products.includes('SP')) {
-          jobs.push(
-            ingestSpDaily({
-              adsClient: scopedClient,
+        const results = await Promise.all(
+          batch.map((profile) =>
+            ingestProfileDate({
+              profile,
+              date,
+              env,
+              config,
+              products,
               pg,
-              profileId: String(profile.profileId),
-              startDate: date,
-              endDate: date,
-              currencyCode: profile.currencyCode,
-              poll: pollLogger('SP'),
-            }).then((r) => ({ product: 'SP' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
-          );
-        }
-        if (products.includes('SD')) {
-          jobs.push(
-            ingestSdDaily({
-              adsClient: scopedClient,
-              pg,
-              profileId: String(profile.profileId),
-              startDate: date,
-              endDate: date,
-              currencyCode: profile.currencyCode,
-              poll: pollLogger('SD'),
-            }).then((r) => ({ product: 'SD' as AdProductKey, rows: r.rowsUpserted, reportId: r.reportId })),
-          );
-        }
+            }),
+          ),
+        );
 
-        const results = await Promise.all(jobs);
-        for (const r of results) {
-          console.log(`    [${r.product}] done: ${r.rows} row(s) upserted (reportId ${r.reportId})`);
-          totals[r.product] += r.rows;
+        for (const result of results) {
+          console.log(`  Profile ${result.profile.profileId} — ${result.profile.accountInfo.name} (${result.profile.countryCode}):`);
+          for (const product of products) {
+            const r = result.byProduct[product];
+            if (r) {
+              console.log(`    [${product}] ${r.rows} row(s) upserted (reportId ${r.reportId})`);
+              totals[product] += r.rows;
+            }
+          }
         }
       }
       console.log('');
@@ -165,6 +165,83 @@ async function main(): Promise<void> {
   } finally {
     await pg.end();
   }
+}
+
+interface IngestProfileDateOpts {
+  profile: AdsProfile;
+  date: string;
+  env: {
+    ADS_API_CLIENT_ID: string;
+    ADS_API_CLIENT_SECRET: string;
+  };
+  config: { region: AdsApiRegion; refreshToken: string; endpoint: string };
+  products: AdProductKey[];
+  pg: PgClient;
+}
+
+/**
+ * Run SP + SD ingest in parallel for one (profile, date). Returns per-product
+ * row counts and reportIds. SP and SD failures are not swallowed — they
+ * surface as rejected promises and bubble up to the caller's Promise.all.
+ */
+async function ingestProfileDate(opts: IngestProfileDateOpts): Promise<ProfileDateResult> {
+  const { profile, date, env, config, products, pg } = opts;
+  const profileId = String(profile.profileId);
+
+  const scopedClient = new AdsApiClient({
+    region: config.region,
+    clientId: env.ADS_API_CLIENT_ID,
+    clientSecret: env.ADS_API_CLIENT_SECRET,
+    refreshToken: config.refreshToken,
+    endpoint: config.endpoint,
+    profileId,
+  });
+
+  // Per-product poll loggers prefix profile + date so concurrent profile
+  // logs interleave readably.
+  const pollLogger = (label: string) => ({
+    onPoll: ({ attempt, status, elapsedMs }: { attempt: number; status: string; elapsedMs: number }) => {
+      console.log(
+        `    [${profileId} ${date} ${label}] poll ${attempt}: status=${status} (${Math.round(elapsedMs / 1000)}s)`,
+      );
+    },
+  });
+
+  const result: ProfileDateResult = { profile, date, byProduct: { SP: undefined, SD: undefined } };
+
+  const jobs: Array<Promise<void>> = [];
+  if (products.includes('SP')) {
+    jobs.push(
+      ingestSpDaily({
+        adsClient: scopedClient,
+        pg,
+        profileId,
+        startDate: date,
+        endDate: date,
+        currencyCode: profile.currencyCode,
+        poll: pollLogger('SP'),
+      }).then((r) => {
+        result.byProduct.SP = { rows: r.rowsUpserted, reportId: r.reportId };
+      }),
+    );
+  }
+  if (products.includes('SD')) {
+    jobs.push(
+      ingestSdDaily({
+        adsClient: scopedClient,
+        pg,
+        profileId,
+        startDate: date,
+        endDate: date,
+        currencyCode: profile.currencyCode,
+        poll: pollLogger('SD'),
+      }).then((r) => {
+        result.byProduct.SD = { rows: r.rowsUpserted, reportId: r.reportId };
+      }),
+    );
+  }
+  await Promise.all(jobs);
+  return result;
 }
 
 function resolveDates(date: string | undefined, days: string | undefined): string[] {
@@ -190,6 +267,26 @@ function resolveProducts(products: string | undefined): AdProductKey[] {
     throw new Error(`--products must be a comma-separated list of: SP, SD. Got "${products}".`);
   }
   return parsed;
+}
+
+/**
+ * Resolve and validate --concurrency. Hard-caps at 5 to avoid blowing past
+ * typical Ads API concurrent-report ceilings (each batched profile adds
+ * 2 concurrent reports — SP + SD — so 5 profiles = 10 concurrent reports).
+ */
+function resolveConcurrency(value: string | undefined): number {
+  if (!value) return 1;
+  const n = parseInt(value, 10);
+  if (Number.isNaN(n) || n < 1) {
+    throw new Error(`--concurrency must be a positive integer. Got "${value}".`);
+  }
+  if (n > 5) {
+    throw new Error(
+      `--concurrency capped at 5 to avoid 429s. Got ${n}. ` +
+      `If your account has a generously increased Ads API quota and you've tested at higher values, raise this cap in src/cli/ads-ingest.ts:resolveConcurrency.`,
+    );
+  }
+  return n;
 }
 
 main().catch((err) => {
