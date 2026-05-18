@@ -62,33 +62,62 @@ This is a **new** profile, separate from your existing SP-API one.
 
 Wait until your Ads API application from Step 1 is approved before doing this — the scope won't work without approval.
 
-1. Open this URL in a browser (replace `<CLIENT_ID>` with the value from Step 2):
+operator-datacore ships a CLI that does both halves of the flow for you: prints the authorisation URL, then exchanges the code for a refresh token. It reads Client ID + Secret from your `.env` so you never type them on the command line.
 
-   ```
-   https://eu.account.amazon.com/ap/oa?client_id=<CLIENT_ID>&scope=advertising::campaign_management&response_type=code&redirect_uri=http://localhost:3000/callback
-   ```
+**Pre-check:** set `ADS_API_CLIENT_ID` and `ADS_API_CLIENT_SECRET` in your `.env` (Step 2 values). If you haven't run `operator-datacore` locally before, do `npm ci` first.
 
-   (For NA accounts use `www.amazon.com` instead of `eu.account.amazon.com`.)
+**3.1 — Print the authorisation URL**
 
-2. Sign in if prompted, then **Allow** the consent screen.
+```
+npm run ads-exchange-code
+```
 
-3. Amazon redirects to `http://localhost:3000/callback?code=ANxxxxx&scope=…`. Your browser will show **"Can't reach localhost"** — that's expected and harmless. **Copy the `code` value out of the URL bar.**
+This prints an `https://www.amazon.com/ap/oa?...` URL. Tips for the next two steps:
 
-4. In a terminal, exchange the code for a refresh token. Replace the four placeholders:
+- **Sign out of advertising.amazon.com first** and sign in as the **specific seller account** you want to authorise (UK Emporium, US Emporium-cookshop, etc.). Amazon's session-stickiness can otherwise default to the wrong account and produce a token that probes against the wrong region. **An incognito / private browsing window is the safest way to guarantee account isolation.**
+- The URL pre-encodes the right scope (`advertising::campaign_management`) and redirect URI (`http://localhost:3000/callback`).
 
-   ```
-   curl -s -X POST https://api.amazon.com/auth/o2/token \
-     -H "Content-Type: application/x-www-form-urlencoded" \
-     -d "grant_type=authorization_code" \
-     -d "code=<CODE>" \
-     -d "redirect_uri=http://localhost:3000/callback" \
-     -d "client_id=<CLIENT_ID>" \
-     -d "client_secret=<CLIENT_SECRET>"
-   ```
+**3.2 — Open the URL → Allow → copy the code**
 
-   You'll get back JSON containing `access_token`, `refresh_token`, `token_type`, `expires_in`. Capture the **`refresh_token`** (starts with `Atzr|`). This is `ADS_API_REFRESH_TOKEN`. The access_token is short-lived (60 min); the client uses the refresh token to generate fresh access tokens automatically.
+Amazon redirects to `http://localhost:3000/callback?code=ANxxxxx&scope=...`. The browser will show **"This site can't be reached"** — that's expected, nothing's running on port 3000. **Copy the `code` value** out of the URL bar (between `code=` and `&scope=`).
 
-   The authorisation code is **single-use and short-lived** (~5 minutes). If you wait too long or get an error, repeat from Step 3.1.
+**3.3 — Exchange the code for a refresh token**
+
+```
+npm run ads-exchange-code -- --code "ANxxxxx"
+```
+
+The output ends with:
+
+```
+Refresh token (paste into .env as ADS_API_REFRESH_TOKEN):
+
+  Atzr|IwEBI...
+
+Token issued. Valid for ~12 months.
+```
+
+Paste the `Atzr|...` value into `.env` as `ADS_API_REFRESH_TOKEN` (or `ADS_API_<REGION>_REFRESH_TOKEN` for multi-region setups — see below).
+
+The authorisation code is **single-use and short-lived** (~5 minutes). If you wait too long, restart from 3.1.
+
+**Multi-region note:** if you're adding NA as a second region alongside an existing EU setup, do Steps 3.1–3.3 again signed in as the US seller. The same LWA app produces a distinct refresh token per (seller, region). Paste the result into `.env` as `ADS_API_NA_REFRESH_TOKEN` (not `ADS_API_REFRESH_TOKEN`, which stays as the primary EU value).
+
+**Fallback — raw curl (only if `npm run ads-exchange-code` isn't available):**
+
+```
+# 1. Build the auth URL by hand, click it in a browser, Allow, copy code.
+# 2. Exchange:
+curl -s -X POST https://api.amazon.com/auth/o2/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  -d "grant_type=authorization_code" \
+  -d "code=<CODE>" \
+  -d "redirect_uri=http://localhost:3000/callback" \
+  -d "client_id=<CLIENT_ID>" \
+  -d "client_secret=<CLIENT_SECRET>"
+```
+
+The response JSON's `refresh_token` (starts with `Atzr|`) is what you want.
 
 ---
 
@@ -96,20 +125,47 @@ Wait until your Ads API application from Step 1 is approved before doing this �
 
 The Ads API uses **Profiles** — one per advertising account per marketplace. You need the Profile ID for the Wrenbury UK ads account.
 
-1. Use the access token from Step 3 (or do another quick token refresh — see "Refreshing access tokens" below) and call:
+With the refresh token from Step 3 in `.env`, run:
 
-   ```
-   curl -s https://advertising-api-eu.amazon.com/v2/profiles \
-     -H "Authorization: Bearer <ACCESS_TOKEN>" \
-     -H "Amazon-Advertising-API-ClientId: <CLIENT_ID>"
-   ```
+```
+npm run ads-probe
+```
 
-2. You'll get a JSON array of profiles. Find the one with `countryCode: "GB"` (or `countryCode: "UK"` on older accounts) and the right account name. Capture:
-   - `profileId` → goes into `ADS_PROFILE_ID` (a long integer like `1234567890123456`)
-   - `countryCode` → confirms `GB` / UK
-   - `currencyCode` → should be `GBP`
+(Or for a non-primary region: `npm run ads-probe -- --region NA` etc.)
 
-If the response is an empty array `[]` or returns `403`, the Ads API access from Step 1 hasn't been granted yet — wait for the approval email and retry.
+The output lists every profile your token can see, one block per profile:
+
+```
+  profileId:    567327329024034
+  account:      Emporium Cookshop & Homewares (seller)
+  marketplace:  A1F83G8C2ARO7P
+  country:      UK
+  currency:     GBP
+  timezone:     Europe/London
+```
+
+Find the one for the marketplace you care about (`UK` / `GBP` for Wrenbury UK; `US` / `USD` for US Emporium-cookshop; etc.). Capture the `profileId` (a long integer) and add it to `.env`:
+
+- Primary region: `ADS_PROFILE_ID=...` (or `ADS_PROFILE_IDS=...,...` for multiple).
+- Secondary region: `ADS_API_<REGION>_PROFILE_ID=...` (or `_PROFILE_IDS` plural).
+
+Re-run `npm run ads-probe` and you should see `OK — profile ... matches "..."` at the end. That's the green light.
+
+**Failure modes:**
+
+- **Empty profile list / 403:** the Ads API access from Step 1 hasn't been granted yet — wait for the approval email and retry.
+- **`invalid_grant`:** the refresh token in `.env` doesn't pair with the Client ID/Secret. Most common cause: pasted the SP-API refresh token into the Ads slot (or vice versa). Re-do Step 3.
+- **Probe succeeds but lists profiles for the wrong region:** check `ADS_API_REGION` in `.env` (or pass `--region` explicitly). A primary-EU operator probing the US seller's token without `--region NA` will hit the EU endpoint and see EU profiles.
+
+**Fallback — raw curl:**
+
+```
+curl -s https://advertising-api-eu.amazon.com/v2/profiles \
+  -H "Authorization: Bearer <ACCESS_TOKEN>" \
+  -H "Amazon-Advertising-API-ClientId: <CLIENT_ID>"
+```
+
+(For NA use `advertising-api.amazon.com`; for FE use `advertising-api-fe.amazon.com`.)
 
 ---
 
