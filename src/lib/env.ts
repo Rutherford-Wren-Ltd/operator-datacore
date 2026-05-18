@@ -151,6 +151,33 @@ export function loadEnvForAmazon(): Env & {
   };
 }
 
+/**
+ * Same as loadEnvForAmazon, but validates only the SHARED LWA credentials
+ * (Client ID + Secret) and not the legacy un-prefixed refresh token. The
+ * refresh token is region-specific, so callers should use
+ * getSpApiRegionConfig(region) to resolve it after this call.
+ *
+ * Use this from multi-region CLIs (backfill, inventory-snapshot) where the
+ * region is selected via --region flag and the legacy SP_API_REFRESH_TOKEN
+ * may not be present (e.g. in a GitHub Actions step that only sets
+ * SP_API_NA_REFRESH_TOKEN).
+ */
+export function loadEnvForAmazonShared(): Env & {
+  SP_API_LWA_CLIENT_ID: string;
+  SP_API_LWA_CLIENT_SECRET: string;
+} {
+  const env = loadEnv();
+  if (!env.SP_API_LWA_CLIENT_ID || !env.SP_API_LWA_CLIENT_SECRET) {
+    throw new Error(
+      'Amazon SP-API shared credentials missing. Set SP_API_LWA_CLIENT_ID and SP_API_LWA_CLIENT_SECRET in .env (or as GitHub Secrets in CI). See docs/runbooks/connect-amazon.md.',
+    );
+  }
+  return env as Env & {
+    SP_API_LWA_CLIENT_ID: string;
+    SP_API_LWA_CLIENT_SECRET: string;
+  };
+}
+
 export type SpApiRegion = 'na' | 'eu' | 'fe';
 
 export interface SpApiRegionConfig {

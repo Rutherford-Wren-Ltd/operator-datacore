@@ -16,7 +16,7 @@
 // ============================================================================
 
 import { parseArgs } from 'node:util';
-import { loadEnvForAmazon, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
+import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { backfillSalesTraffic } from '../lib/sp-api/sales-traffic.js';
@@ -74,7 +74,7 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const env = loadEnvForAmazon();
+  const env = loadEnvForAmazonShared();
   const region: SpApiRegion = args.region ?? env.SP_API_REGION;
   const regionConfig = getSpApiRegionConfig(region, env);
   const marketplaceIds = regionConfig.marketplaceIds;
