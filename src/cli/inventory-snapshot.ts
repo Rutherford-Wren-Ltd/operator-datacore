@@ -69,6 +69,7 @@ async function main(): Promise<void> {
     const startedAt = Date.now();
     let totalRows = 0;
 
+    let totalSkipped = 0;
     for (const marketplaceId of regionConfig.marketplaceIds) {
       console.log(`Marketplace ${marketplaceId}:`);
       const result = await snapshotFbaInventory({
@@ -76,11 +77,20 @@ async function main(): Promise<void> {
         pg,
         marketplaceId,
         onPage: (info) => {
-          console.log(`  page ${info.page}: ${info.rowsFetched} SKUs (cumulative ${info.cumulativeRows})`);
+          console.log(
+            `  page ${info.page}: ${info.rowsFetched} SKUs from API ` +
+            `(written ${info.cumulativeRows}, skipped ${info.cumulativeSkipped} zero-inventory)`,
+          );
         },
       });
       totalRows += result.totalRows;
-      console.log(`  done: ${result.totalRows} SKUs across ${result.pages} page(s) for snapshot_date ${result.snapshotDate}`);
+      totalSkipped += result.skipped;
+      const total = result.totalRows + result.skipped;
+      const pct = total > 0 ? ((result.skipped / total) * 100).toFixed(1) : '0.0';
+      console.log(
+        `  done: ${result.totalRows} SKUs written, ${result.skipped} skipped (${pct}% zero-inventory) ` +
+        `across ${result.pages} page(s) for snapshot_date ${result.snapshotDate}`,
+      );
     }
 
     const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -94,7 +104,12 @@ async function main(): Promise<void> {
     );
 
     console.log('');
-    console.log(`Done in ${durationSec}s. ${totalRows} SKU snapshots upserted into brain.fba_inventory_snapshot.`);
+    const totalSeen = totalRows + totalSkipped;
+    const pct = totalSeen > 0 ? ((totalSkipped / totalSeen) * 100).toFixed(1) : '0.0';
+    console.log(
+      `Done in ${durationSec}s. ${totalRows} SKU snapshots written, ` +
+      `${totalSkipped} skipped as zero-inventory (${pct}% of ${totalSeen} seen).`,
+    );
   } finally {
     await pg.end();
   }

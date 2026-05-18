@@ -71,13 +71,21 @@ export interface SnapshotOptions {
   pg: PgClient;
   marketplaceId: string;
   snapshotDate?: Date;
-  onPage?: (info: { page: number; rowsFetched: number; cumulativeRows: number }) => void;
+  onPage?: (info: {
+    page: number;
+    rowsFetched: number;
+    cumulativeRows: number;
+    cumulativeSkipped: number;
+  }) => void;
 }
 
 export interface SnapshotResult {
   marketplaceId: string;
   snapshotDate: string;
+  /** Rows actually written. Excludes ones filtered as zero-inventory + no-inbound. */
   totalRows: number;
+  /** Rows seen by the API but skipped because they had no live or inbound inventory. */
+  skipped: number;
   pages: number;
 }
 
@@ -94,6 +102,7 @@ export async function snapshotFbaInventory(opts: SnapshotOptions): Promise<Snaps
   let nextToken: string | undefined = undefined;
   let page = 0;
   let totalRows = 0;
+  let skipped = 0;
 
   do {
     page += 1;
@@ -123,7 +132,7 @@ export async function snapshotFbaInventory(opts: SnapshotOptions): Promise<Snaps
         err.status === 400 &&
         /Next token is invalid or expired/i.test(err.responseText)
       ) {
-        opts.onPage?.({ page, rowsFetched: 0, cumulativeRows: totalRows });
+        opts.onPage?.({ page, rowsFetched: 0, cumulativeRows: totalRows, cumulativeSkipped: skipped });
         console.error(`  nextToken expired between pages — stopping at ${totalRows} rows; remainder will be picked up next run.`);
         break;
       }
@@ -137,6 +146,29 @@ export async function snapshotFbaInventory(opts: SnapshotOptions): Promise<Snaps
       if (!sku) continue;
       const d = s.inventoryDetails ?? {};
       const total = s.totalQuantity ?? 0;
+
+      // Skip SKUs with no live inventory and no inbound. getInventorySummaries
+      // returns the full "ever-listed" SKU tail (~25k for this account), but
+      // most rows are zero across every column — discontinued or never-stocked
+      // SKUs that still have an Amazon listing. Storing them blows out the
+      // free-tier quota (~98% of writes daily); their absence carries the
+      // same information (no inventory) at zero storage cost.
+      //
+      // What "no inventory" means here: total = 0 AND every inbound flavor
+      // = 0. We keep rows where any inbound > 0 because that's a SKU on
+      // its way back to relevance.
+      const inboundWorking = d.inboundWorkingQuantity ?? 0;
+      const inboundShipped = d.inboundShippedQuantity ?? 0;
+      const inboundReceiving = d.inboundReceivingQuantity ?? 0;
+      if (
+        total === 0 &&
+        inboundWorking === 0 &&
+        inboundShipped === 0 &&
+        inboundReceiving === 0
+      ) {
+        skipped += 1;
+        continue;
+      }
 
       await opts.pg.query(
         `INSERT INTO brain.fba_inventory_snapshot (
@@ -194,10 +226,15 @@ export async function snapshotFbaInventory(opts: SnapshotOptions): Promise<Snaps
       totalRows += 1;
     }
 
-    opts.onPage?.({ page, rowsFetched: summaries.length, cumulativeRows: totalRows });
+    opts.onPage?.({
+      page,
+      rowsFetched: summaries.length,
+      cumulativeRows: totalRows,
+      cumulativeSkipped: skipped,
+    });
     nextToken = res.payload?.pagination?.nextToken;
     if (nextToken) await sleep(INTER_PAGE_DELAY_MS);
   } while (nextToken);
 
-  return { marketplaceId: opts.marketplaceId, snapshotDate, totalRows, pages: page };
+  return { marketplaceId: opts.marketplaceId, snapshotDate, totalRows, skipped, pages: page };
 }
