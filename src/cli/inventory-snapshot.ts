@@ -10,7 +10,7 @@
 // ============================================================================
 
 import { parseArgs } from 'node:util';
-import { loadEnvForAmazon, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
+import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { snapshotFbaInventory } from '../lib/sp-api/inventory.js';
@@ -22,7 +22,7 @@ async function main(): Promise<void> {
     },
   });
 
-  const env = loadEnvForAmazon();
+  const env = loadEnvForAmazonShared();
   const region: SpApiRegion = (values.region as SpApiRegion | undefined) ?? env.SP_API_REGION;
   if (region !== 'na' && region !== 'eu' && region !== 'fe') {
     throw new Error(`--region must be one of: na, eu, fe. Got "${region}".`);
