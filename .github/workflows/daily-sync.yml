@@ -153,7 +153,7 @@ jobs:
           SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
         run: npm run inventory-snapshot -- --region na
 
-      - name: Pull Ads SP + SD daily (D-1)
+      - name: Pull Ads SP + SD daily (primary region — EU)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -166,9 +166,10 @@ jobs:
           ADS_API_REGION: ${{ secrets.ADS_API_REGION }}
           ADS_API_ENDPOINT: ${{ secrets.ADS_API_ENDPOINT }}
         run: |
-          # Sponsored Products advertised-product report for yesterday.
-          # Async report: createReport → poll (~1–10 min) → gzipped JSON download
-          # → upsert into brain.ads_sp_daily. Idempotent for the date.
+          # Sponsored Products + Sponsored Display advertised-product reports
+          # for yesterday. Each report: createReport → poll (~1-10 min) →
+          # gzipped JSON download → upsert into brain.ads_sp_daily /
+          # brain.ads_sd_daily. SP + SD run in parallel. Idempotent for the date.
           #
           # Attribution windows (sales_7d/14d/30d on a given day) keep growing
           # for up to 30 days as Amazon attributes downstream conversions. We
@@ -177,3 +178,20 @@ jobs:
           # to capture ripening is a follow-up (rolling window or a weekly
           # 30-day re-sync).
           npm run ads-ingest
+
+      - name: Pull Ads SP + SD daily (NA)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          ADS_API_CLIENT_ID: ${{ secrets.ADS_API_CLIENT_ID }}
+          ADS_API_CLIENT_SECRET: ${{ secrets.ADS_API_CLIENT_SECRET }}
+          ADS_API_NA_REFRESH_TOKEN: ${{ secrets.ADS_API_NA_REFRESH_TOKEN }}
+          ADS_API_NA_PROFILE_ID: ${{ secrets.ADS_API_NA_PROFILE_ID }}
+        run: |
+          # Same Ads pipeline, NA region. Client ID + Secret are shared
+          # across regions (single LWA app); NA refresh token + profile
+          # ID are NA-specific. Endpoint is derived automatically from
+          # --region (advertising-api.amazon.com for NA).
+          npm run ads-ingest -- --region NA
