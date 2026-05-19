@@ -453,13 +453,14 @@ async function main(): Promise<void> {
     const totalUpserted = stats.suppliers.created + stats.suppliers.updated +
                           stats.skus.created + stats.skus.updated;
 
+    // meta.sync_run.duration_ms is a generated column (finished_at - started_at),
+    // so we don't write it — Postgres computes it from finished_at.
     await pg.query(
       `UPDATE meta.sync_run
          SET finished_at = NOW(), status = 'success',
-             rows_fetched = $2, rows_upserted = $2,
-             duration_ms = $3
+             rows_fetched = $2, rows_upserted = $2
        WHERE sync_run_id = $1`,
-      [syncRunId, totalUpserted, durationMs],
+      [syncRunId, totalUpserted],
     );
 
     console.log('');
