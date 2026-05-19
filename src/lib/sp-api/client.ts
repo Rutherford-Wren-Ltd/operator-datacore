@@ -57,7 +57,11 @@ export class SpApiClient {
         onFailedAttempt: async (err) => {
           if (err instanceof SpApiError && err.status >= 400 && err.status < 500 && err.status !== 429) {
             // Permanent client errors (auth, malformed) — don't retry.
-            throw new AbortError(err.message);
+            // Pass the SpApiError as AbortError's argument (not just its message)
+            // so callers can unwrap via .originalError and inspect status /
+            // responseText. Required by inventory-snapshot's graceful handling
+            // of expired-nextToken-after-429.
+            throw new AbortError(err);
           }
           // SP-API's createReport quota is a small burst bucket with a slow
           // refill; pRetry's exponential backoff (~31s total) is far too
