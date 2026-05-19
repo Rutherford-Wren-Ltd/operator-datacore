@@ -127,10 +127,20 @@ export async function snapshotFbaInventory(opts: SnapshotOptions): Promise<Snaps
       // expired". Treat that as graceful end-of-pagination — the rows we
       // have already upserted are valid; subsequent pages will be picked
       // up on the next daily run.
+      //
+      // p-retry can surface this either as SpApiError directly OR wrapped
+      // in AbortError (when client.ts marks the 4xx as non-retryable).
+      // Handle both — see client.ts onFailedAttempt.
+      const spErr =
+        err instanceof SpApiError
+          ? err
+          : (err as { originalError?: unknown })?.originalError instanceof SpApiError
+            ? ((err as { originalError: SpApiError }).originalError)
+            : null;
       if (
-        err instanceof SpApiError &&
-        err.status === 400 &&
-        /Next token is invalid or expired/i.test(err.responseText)
+        spErr &&
+        spErr.status === 400 &&
+        /Next token is invalid or expired/i.test(spErr.responseText)
       ) {
         opts.onPage?.({ page, rowsFetched: 0, cumulativeRows: totalRows, cumulativeSkipped: skipped });
         console.error(`  nextToken expired between pages — stopping at ${totalRows} rows; remainder will be picked up next run.`);
