@@ -43,6 +43,7 @@
     "ads-exchange-code": "tsx src/cli/ads-exchange-code.ts",
     "ads-ingest": "tsx src/cli/ads-ingest.ts",
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
+    "import-masters": "tsx src/cli/import-masters.ts",
     "verify": "tsx src/cli/verify.ts",
     "exchange-code": "tsx src/cli/exchange-code.ts",
     "check:migrations": "tsx src/cli/check-migrations.ts",
