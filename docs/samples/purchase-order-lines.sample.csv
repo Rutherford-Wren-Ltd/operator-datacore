@@ -1,4 +1,6 @@
-po_number,line_no,ean,asin,supplier_sku,description,qty_ordered,qty_received,unit_cost,line_status,notes
-PO-2026-001,1,5060784495145,,,Garden Tool Handheld Sharpener,1000,0,5.13,open,
-PO-2026-001,2,5060784492656,,,Classics Set of 6 Ivory Steak Knives,500,0,3.78,open,
-PO-2026-002,1,5060784493332,,,Wrenbury storage basket,200,0,20.16,open,
+po_number,line_no,line_type,ean,asin,supplier_sku,description,destination,serves_region,qty_ordered,qty_received,line_status,comp_fob,comp_lcl,comp_import_duty,import_duty_rate,comp_qa,comp_china_3pl,comp_freight_dock,comp_photos,comp_bond_fee,comp_amz_location_fee,comp_azus_storage,landed_cost_currency,stated_landed_cost,packages_line_no,notes
+PO-2026-001,1,product,5060784495145,,,Garden Tool Handheld Sharpener,uk_3pl_lemonpath,uk_eu,600,0,open,3.20,0.45,,,0.12,0.18,0.55,0.03,,,,GBP,4.80,,UK split — 600 of 1000
+PO-2026-001,2,product,5060784495145,,,Garden Tool Handheld Sharpener,usa_awd,na,400,0,open,4.10,0.60,0.34,0.0820,0.15,0.20,0.70,0.04,0.05,0.11,0.09,USD,6.73,,USA split — 400 of 1000
+PO-2026-001,3,packaging,,,,Branded sleeve + carton (UK leg),uk_3pl_lemonpath,uk_eu,600,0,open,0.22,0.02,,,,0.03,,,,,,GBP,,1,Separately invoiced — folds into line 1
+PO-2026-001,4,packaging,,,,Branded sleeve + carton (USA leg),usa_awd,na,400,0,open,0.24,,0.08,0.3500,,0.03,,,,,,USD,,2,Separately invoiced (35% duty bracket) — folds into line 2
+PO-2026-002,1,product,5060784493332,,,Wrenbury storage basket,fba_direct,uk_eu,200,0,open,14.00,1.20,,,0.40,0.60,2.50,0.06,,,,GBP,18.76,,
