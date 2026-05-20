@@ -1,0 +1,3 @@
+po_number,supplier_id,status,destination,serves_region,currency,order_date,expected_ship_date,actual_ship_date,expected_arrival_date,actual_arrival_date,payment_terms,total_value,deposit_amount,balance_amount,payment_status,notes
+PO-2026-001,SUP-020,confirmed,uk_3pl_lemonpath,uk_eu,USD,2026-05-12,2026-06-20,,2026-07-15,,20% deposit / 80% 30 days after shipment,8400.00,1680.00,6720.00,deposit_paid,First Justa Knives PO of the season
+PO-2026-002,SUP-018,placed,fba_direct,uk_eu,GBP,2026-05-18,,,,,30 days from date of invoice,3200.00,,,unpaid,
