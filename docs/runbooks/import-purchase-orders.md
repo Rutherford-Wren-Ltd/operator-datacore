@@ -22,7 +22,29 @@ line gained the landed-cost component columns.
 - Before a weekly restock cycle, so `/restock-memo` sees current committed stock.
 - Any time a PO changes status (placed, shipped, received, ...).
 
-## What you need
+## Two ways in: the workbook template, or the CSV pair
+
+**Standard path — the PO workbook template (`.xlsx`).** Fill in
+`docs/samples/po-workbook-template.xlsx` (one workbook per PO) and import it directly:
+
+```
+cd infrastructure/operator-datacore
+npm run import-purchase-orders -- --workbook "<path to PO.xlsx>" --dry-run
+npm run import-purchase-orders -- --workbook "<path to PO.xlsx>"
+npm run import-purchase-orders -- --workbook-dir "<folder of PO .xlsx files>"
+```
+
+The template has a **PO Info** tab (the header) and a **Lines** tab (one row per SKU, with
+`qty_uk_3pl` / `qty_fba_uk` / `qty_usa_awd` / `qty_rw_held` quantity columns). The importer
+expands each non-zero quantity column into one PO line at that destination, so a SKU split
+UK/USA becomes two lines automatically. The `Instructions` tab in the template explains
+every field; regenerate the template with `npm run build-po-template`.
+
+**CSV pair** — still fully supported, and the rest of this runbook documents its exact
+columns. Use it for bulk or programmatic loads. Both paths share the same validation,
+packaging fold, draft gating and `meta.sync_run` bookkeeping.
+
+## What you need (CSV pair)
 
 Two CSV files, exported from the PO workbook, in a gitignored folder
 (`seller-sessions-2026/imports/` is the convention):
