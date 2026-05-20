@@ -45,6 +45,7 @@
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "import-masters": "tsx src/cli/import-masters.ts",
     "import-purchase-orders": "tsx src/cli/import-purchase-orders.ts",
+    "set-po-status": "tsx src/cli/set-po-status.ts",
     "verify": "tsx src/cli/verify.ts",
     "exchange-code": "tsx src/cli/exchange-code.ts",
     "check:migrations": "tsx src/cli/check-migrations.ts",

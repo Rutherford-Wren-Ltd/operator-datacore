@@ -114,11 +114,33 @@ point at differently-named files use `--orders-csv` and `--lines-csv` instead.
   the `comp_packaging_allocated` of the product line named by its `packages_line_no`, and
   that product line's `landed_cost` is re-summed. Packaging is thus costed once, inside
   the product.
-- **`brain.sku_landed_cost`** is upserted from every product line (per `ean` +
-  `serves_region`), with the PO's `order_date` as `as_of_date`. A **newer-wins guard**
-  means re-importing an older PO never regresses a SKU's landed cost.
+- **`brain.sku_landed_cost`** is upserted from every product line of a **placed** PO (any
+  status past `draft`, and not `cancelled`), per `ean` + `serves_region`, with the PO's
+  `order_date` as `as_of_date`. A **newer-wins guard** means re-importing an older PO
+  never regresses a SKU's landed cost.
 - A status change recorded by the import is logged to `brain.purchase_order_status_history`.
 - The run is recorded in `meta.sync_run` (`object='purchase_orders'`).
+
+## Draft POs
+
+RW drafts a PO during forecast/stock review — weeks or months before sending it to the
+supplier — and finalises real costs only at the point of placing. So a `status=draft` PO
+is handled differently:
+
+- Its lines import in full (the estimated `comp_*` figures are recorded), but its
+  **estimated costs do not populate `brain.sku_landed_cost`** — a draft's costs are not
+  authoritative COGS. Same for a `cancelled` PO.
+- `order_date` is the *placed* date — leave it **blank** for a draft. A draft with no
+  `order_date` is the expected state and is **not** warned about.
+- A draft PO does not count as committed stock (`brain.po_committed_inventory` excludes
+  it), so it never offsets a restock gap.
+
+**When a draft PO is placed:** its costs are finalised at the same time, so the workflow
+is — update the workbook with final costs, re-export the CSV pair, and **re-import** with
+`status` set to `placed` (and `order_date` filled). That single re-import flips the status
+*and* populates `brain.sku_landed_cost`. For a status change with **no** cost change
+(placed → confirmed → shipped → …), use `set-po-status` instead — see
+[po-lifecycle.md](po-lifecycle.md).
 
 ## Hard errors vs warnings
 
@@ -138,8 +160,8 @@ point at differently-named files use `--orders-csv` and `--lines-csv` instead.
   the EAN)
 - a computed `landed_cost` that drifts from the line's `stated_landed_cost`
 - a packaging line with no `packages_line_no` (its cost folds into nothing)
-- a product line whose PO has no `order_date` (landed cost not written to
-  `brain.sku_landed_cost`)
+- a product line on a **non-draft** PO that has no `order_date` (landed cost not written
+  to `brain.sku_landed_cost`). A *draft* PO with no `order_date` is expected — not warned.
 
 After a run, review warnings:
 

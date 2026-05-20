@@ -345,7 +345,7 @@ function parseLineRow(row: string[], idx: Record<string, number>): PoLineRow | {
 function applyPackagingFold(lines: PoLineRow[], stats: ImportStats): void {
   const productByKey = new Map<string, PoLineRow>();
   for (const l of lines) {
-    if (l.line_type === 'product') productByKey.set(`${l.po_number} ${l.line_no}`, l);
+    if (l.line_type === 'product') productByKey.set(`${l.po_number}\u0000${l.line_no}`, l);
   }
   for (const pkg of lines) {
     if (pkg.line_type !== 'packaging') continue;
@@ -356,7 +356,7 @@ function applyPackagingFold(lines: PoLineRow[], stats: ImportStats): void {
       });
       continue;
     }
-    const product = productByKey.get(`${pkg.po_number} ${pkg.packages_line_no}`);
+    const product = productByKey.get(`${pkg.po_number}\u0000${pkg.packages_line_no}`);
     if (!product) {
       stats.errors.push(`PO ${pkg.po_number} line ${pkg.line_no}: packages_line_no ${pkg.packages_line_no} does not match a product line in the same PO`);
       continue;
@@ -371,15 +371,23 @@ function applyPackagingFold(lines: PoLineRow[], stats: ImportStats): void {
 // ----------------------------------------------------------------------------
 // SKU landed-cost candidates — one per (ean, serves_region) across all product
 // lines, last-seen wins within an import (a disagreement is warned about).
+// Draft and cancelled POs are skipped: their line costs are estimates and must
+// never become authoritative COGS in brain.sku_landed_cost.
 // ----------------------------------------------------------------------------
 function buildSlcCandidates(
   lines: PoLineRow[],
   orderDateByPo: Map<string, string | null>,
+  statusByPo: Map<string, string>,
   stats: ImportStats,
 ): Map<string, SlcCandidate> {
   const out = new Map<string, SlcCandidate>();
   for (const l of lines) {
     if (l.line_type !== 'product') continue;
+    // A draft PO's costs are estimates; a cancelled PO's are moot. Either way
+    // they do not feed sku_landed_cost — and a draft with no order_date is the
+    // expected state, so skip before the order_date check fires a warning.
+    const status = statusByPo.get(l.po_number);
+    if (status === 'draft' || status === 'cancelled') continue;
     if (!l.ean || l.landed_cost === null || !l.landed_cost_currency) continue;
     const asOf = orderDateByPo.get(l.po_number) ?? null;
     if (!asOf) {
@@ -389,7 +397,7 @@ function buildSlcCandidates(
       });
       continue;
     }
-    const key = `${l.ean} ${l.serves_region}`;
+    const key = `${l.ean}\u0000${l.serves_region}`;
     const prev = out.get(key);
     if (prev && prev.landed_cost !== l.landed_cost) {
       stats.warnings.push({
@@ -504,11 +512,11 @@ async function main(): Promise<void> {
   const lineNoSeen = new Set<string>();
   const natKeySeen = new Set<string>();
   for (const l of lines) {
-    const lk = `${l.po_number} ${l.line_no}`;
+    const lk = `${l.po_number}\u0000${l.line_no}`;
     if (lineNoSeen.has(lk)) stats.errors.push(`PO ${l.po_number}: duplicate line_no ${l.line_no}`);
     lineNoSeen.add(lk);
     if (l.ean) {
-      const nk = `${l.po_number} ${l.ean} ${l.destination} ${l.line_type}`;
+      const nk = `${l.po_number}\u0000${l.ean}\u0000${l.destination}\u0000${l.line_type}`;
       if (natKeySeen.has(nk)) {
         stats.errors.push(`PO ${l.po_number}: duplicate (ean ${l.ean}, destination ${l.destination}, ${l.line_type}) — collapses to one row`);
       }
@@ -545,7 +553,8 @@ async function main(): Promise<void> {
   console.log('');
 
   const orderDateByPo = new Map(headers.map(h => [h.po_number, h.order_date]));
-  const slcCandidates = buildSlcCandidates(lines, orderDateByPo, stats);
+  const statusByPo = new Map(headers.map(h => [h.po_number, h.status]));
+  const slcCandidates = buildSlcCandidates(lines, orderDateByPo, statusByPo, stats);
 
   const pg = await getPgClient();
   try {
@@ -592,10 +601,10 @@ async function main(): Promise<void> {
            WHERE (ean, region) IN (${cand.map((_, i) => `($${i * 2 + 1},$${i * 2 + 2})`).join(',')})`,
           cand.flatMap(c => [c.ean, c.region]),
         );
-        const existingAsOf = new Map(existing.map(r => [`${r.ean} ${r.region}`, r.as_of_date]));
+        const existingAsOf = new Map(existing.map(r => [`${r.ean}\u0000${r.region}`, r.as_of_date]));
         let wIns = 0, wUpd = 0, wSkip = 0;
         for (const c of cand) {
-          const prior = existingAsOf.get(`${c.ean} ${c.region}`);
+          const prior = existingAsOf.get(`${c.ean}\u0000${c.region}`);
           if (prior === undefined) wIns++;
           else if (c.as_of_date >= prior) wUpd++;
           else wSkip++;
@@ -738,7 +747,7 @@ async function main(): Promise<void> {
         );
         const poLineId = res.rows[0]!.po_line_id;
         lineIdByNo.set(l.line_no, poLineId);
-        lineIdByKey.set(`${poNumber} ${l.line_no}`, poLineId);
+        lineIdByKey.set(`${poNumber}\u0000${l.line_no}`, poLineId);
         stats.lines.inserted++;
       }
     }
@@ -747,7 +756,7 @@ async function main(): Promise<void> {
     // in). The WHERE guard means an older PO never regresses a newer figure.
     for (const c of slcCandidates.values()) {
       const sourcePoId = poIdByNumber.get(c.source_po_number) ?? null;
-      const sourceLineId = lineIdByKey.get(`${c.source_po_number} ${c.source_line_no}`) ?? null;
+      const sourceLineId = lineIdByKey.get(`${c.source_po_number}\u0000${c.source_line_no}`) ?? null;
       const up = await pg.query<{ inserted: boolean }>(
         `INSERT INTO brain.sku_landed_cost
            (ean, region, landed_cost, landed_cost_currency, as_of_date, source_po_id, source_po_line_id)
