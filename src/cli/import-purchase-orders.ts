@@ -26,9 +26,10 @@
 // ============================================================================
 
 import { parseArgs } from 'node:util';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { getPgClient } from '../lib/supabase.js';
+import { readPoWorkbook, ORDER_COLUMNS, LINE_COLUMNS } from '../lib/po-workbook.js';
 
 // ----------------------------------------------------------------------------
 // Allowed enum values — must match the CHECK constraints in 0013 / 0015.
@@ -427,39 +428,90 @@ async function main(): Promise<void> {
       'import-dir':   { type: 'string' },
       'orders-csv':   { type: 'string' },
       'lines-csv':    { type: 'string' },
+      'workbook':     { type: 'string' },
+      'workbook-dir': { type: 'string' },
       'dry-run':      { type: 'boolean', default: false },
     },
   });
-
-  const importDir = values['import-dir'] ?? process.env.IMPORT_DIR;
-  const ordersCsv = values['orders-csv']
-    ?? (importDir ? path.join(importDir, 'purchase-orders.csv') : undefined);
-  const linesCsv = values['lines-csv']
-    ?? (importDir ? path.join(importDir, 'purchase-order-lines.csv') : undefined);
   const dryRun = !!values['dry-run'];
-
-  if (!ordersCsv || !linesCsv) {
-    console.error('Error: pass --import-dir, or both --orders-csv and --lines-csv (or set IMPORT_DIR).');
-    process.exit(1);
-  }
-  if (!existsSync(ordersCsv)) {
-    console.error(`Error: purchase-orders CSV not found at ${ordersCsv}`);
-    process.exit(1);
-  }
-  if (!existsSync(linesCsv)) {
-    console.error(`Error: purchase-order-lines CSV not found at ${linesCsv}`);
-    process.exit(1);
-  }
 
   console.log('operator-datacore — import purchase orders');
   console.log('-------------------------------------------');
-  console.log(`  Orders CSV: ${ordersCsv}`);
-  console.log(`  Lines CSV:  ${linesCsv}`);
-  console.log(`  Dry-run:    ${dryRun}`);
-  console.log('');
 
-  const ordersData = parseCSV(readFileSync(ordersCsv, 'utf8'));
-  const linesData = parseCSV(readFileSync(linesCsv, 'utf8'));
+  // Input is either standardised PO workbook(s) (.xlsx) or the CSV pair. Both
+  // resolve to the same { header, rows } shape; everything downstream is shared.
+  let ordersData: { header: string[]; rows: string[][] };
+  let linesData: { header: string[]; rows: string[][] };
+  let sourceRef: string;
+
+  const workbook = values['workbook'];
+  const workbookDir = values['workbook-dir'];
+
+  if (workbook || workbookDir) {
+    let files: string[];
+    if (workbookDir) {
+      if (!existsSync(workbookDir)) {
+        console.error(`Error: workbook dir not found at ${workbookDir}`);
+        process.exit(1);
+      }
+      files = readdirSync(workbookDir)
+        .filter(f => f.toLowerCase().endsWith('.xlsx') && !f.startsWith('~$'))
+        .sort()
+        .map(f => path.join(workbookDir, f));
+      if (files.length === 0) {
+        console.error(`Error: no .xlsx files in ${workbookDir}`);
+        process.exit(1);
+      }
+      sourceRef = path.basename(workbookDir);
+    } else {
+      if (!existsSync(workbook!)) {
+        console.error(`Error: workbook not found at ${workbook}`);
+        process.exit(1);
+      }
+      files = [workbook!];
+      sourceRef = path.basename(workbook!);
+    }
+    console.log(`  Workbooks:  ${files.length}`);
+    console.log(`  Dry-run:    ${dryRun}`);
+    console.log('');
+    const orderRows: string[][] = [];
+    const allLineRows: string[][] = [];
+    for (const f of files) {
+      const { orderRow, lineRows } = await readPoWorkbook(f);
+      orderRows.push(orderRow);
+      allLineRows.push(...lineRows);
+      console.log(`  ${path.basename(f)} — ${lineRows.length} line(s)`);
+    }
+    console.log('');
+    ordersData = { header: ORDER_COLUMNS, rows: orderRows };
+    linesData = { header: LINE_COLUMNS, rows: allLineRows };
+  } else {
+    const importDir = values['import-dir'] ?? process.env.IMPORT_DIR;
+    const ordersCsv = values['orders-csv']
+      ?? (importDir ? path.join(importDir, 'purchase-orders.csv') : undefined);
+    const linesCsv = values['lines-csv']
+      ?? (importDir ? path.join(importDir, 'purchase-order-lines.csv') : undefined);
+    if (!ordersCsv || !linesCsv) {
+      console.error('Error: pass --workbook / --workbook-dir, or --import-dir, or both --orders-csv and --lines-csv (or set IMPORT_DIR).');
+      process.exit(1);
+    }
+    if (!existsSync(ordersCsv)) {
+      console.error(`Error: purchase-orders CSV not found at ${ordersCsv}`);
+      process.exit(1);
+    }
+    if (!existsSync(linesCsv)) {
+      console.error(`Error: purchase-order-lines CSV not found at ${linesCsv}`);
+      process.exit(1);
+    }
+    console.log(`  Orders CSV: ${ordersCsv}`);
+    console.log(`  Lines CSV:  ${linesCsv}`);
+    console.log(`  Dry-run:    ${dryRun}`);
+    console.log('');
+    ordersData = parseCSV(readFileSync(ordersCsv, 'utf8'));
+    linesData = parseCSV(readFileSync(linesCsv, 'utf8'));
+    sourceRef = path.basename(ordersCsv);
+  }
+
   const ordersIdx = buildIndex(ordersData.header);
   const linesIdx = buildIndex(linesData.header);
 
@@ -559,15 +611,24 @@ async function main(): Promise<void> {
   const pg = await getPgClient();
   try {
     // Validate supplier_ids + load EAN set, all before opening the write txn.
-    const { rows: supRows } = await pg.query<{ supplier_id: string }>(
-      'SELECT supplier_id FROM brain.supplier_master',
+    const { rows: supRows } = await pg.query<{ supplier_id: string; name: string }>(
+      'SELECT supplier_id, name FROM brain.supplier_master',
     );
     const knownSuppliers = new Set(supRows.map(r => r.supplier_id));
+    // The workbook PO Info tab may give a supplier name instead of a SUP-id;
+    // resolve names here so the rest of the importer only deals in ids.
+    const supplierByName = new Map(supRows.map(r => [r.name.trim().toLowerCase(), r.supplier_id]));
+    for (const h of headers) {
+      if (!knownSuppliers.has(h.supplier_id)) {
+        const resolved = supplierByName.get(h.supplier_id.trim().toLowerCase());
+        if (resolved) h.supplier_id = resolved;
+      }
+    }
     const unknownSuppliers = [...new Set(headers.map(h => h.supplier_id))]
       .filter(s => !knownSuppliers.has(s));
     if (unknownSuppliers.length > 0) {
-      console.error(`Refusing to import — supplier_id(s) not in brain.supplier_master: ${unknownSuppliers.join(', ')}`);
-      console.error('Add them to supplier-master.csv and run import-masters first.');
+      console.error(`Refusing to import — supplier(s) not in brain.supplier_master: ${unknownSuppliers.join(', ')}`);
+      console.error('Use the SUP-id or the exact supplier name; add new suppliers via import-masters first.');
       process.exit(1);
     }
 
@@ -689,7 +750,7 @@ async function main(): Promise<void> {
           h.order_date, h.expected_ship_date, h.actual_ship_date,
           h.expected_arrival_date, h.actual_arrival_date,
           h.payment_terms, h.total_value, h.deposit_amount, h.balance_amount,
-          h.payment_status, path.basename(ordersCsv), h.notes,
+          h.payment_status, sourceRef, h.notes,
         ],
       );
       poIdByNumber.set(h.po_number, res.rows[0]!.po_id);
