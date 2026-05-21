@@ -44,6 +44,7 @@
     "ads-ingest": "tsx src/cli/ads-ingest.ts",
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "import-masters": "tsx src/cli/import-masters.ts",
+    "import-fba-fees": "tsx src/cli/import-fba-fees.ts",
     "import-purchase-orders": "tsx src/cli/import-purchase-orders.ts",
     "import-forecast": "tsx src/cli/import-forecast.ts",
     "build-po-template": "tsx src/cli/build-po-template.ts",

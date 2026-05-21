@@ -430,7 +430,10 @@ async function main(): Promise<void> {
            moq            = EXCLUDED.moq,
            lead_time_days = EXCLUDED.lead_time_days,
            cogs_landed    = EXCLUDED.cogs_landed,
-           fba_fee        = EXCLUDED.fba_fee,
+           -- fba_fee is also written by the import-fba-fees CLI (SP-API
+           -- getMyFeesEstimates). COALESCE so a blank CSV cell preserves an
+           -- API-sourced value rather than nulling it; a filled cell still wins.
+           fba_fee        = COALESCE(EXCLUDED.fba_fee, brain.sku_master.fba_fee),
            launched       = EXCLUDED.launched,
            status         = EXCLUDED.status,
            marketplace    = EXCLUDED.marketplace,
