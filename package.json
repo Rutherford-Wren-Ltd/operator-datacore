@@ -48,6 +48,7 @@
     "import-forecast": "tsx src/cli/import-forecast.ts",
     "build-po-template": "tsx src/cli/build-po-template.ts",
     "set-po-status": "tsx src/cli/set-po-status.ts",
+    "generate-pos": "tsx src/cli/generate-pos.ts",
     "verify": "tsx src/cli/verify.ts",
     "exchange-code": "tsx src/cli/exchange-code.ts",
     "check:migrations": "tsx src/cli/check-migrations.ts",
