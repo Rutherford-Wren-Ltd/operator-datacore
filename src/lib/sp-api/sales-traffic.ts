@@ -227,11 +227,23 @@ export async function ingestSalesTrafficDay(opts: RunSalesTrafficOptions): Promi
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+// Amazon's permanent SP-API limit for GET_SALES_AND_TRAFFIC_REPORT (confirmed
+// 2026-05-26): 1 createReport call per 15 minutes, app-wide. These floors are
+// enforced regardless of the values the caller passes — passing lower values
+// only earns a warning.
+const SALES_TRAFFIC_MIN_DELAY_MS = 15 * 60 * 1000;
+const SALES_TRAFFIC_MAX_CONCURRENCY = 1;
+
 /**
  * Backfill Sales & Traffic for a window of days, across one or more marketplaces.
- * Concurrency-limited so we don't blow the createReport rate limit. pLimit caps
- * how many run at once but not the rate, so delayMs adds a pause after each task
- * to keep us under the Sales & Traffic createReport quota (~1/min).
+ *
+ * Rate-limit handling is non-negotiable: concurrency is clamped to 1 and the
+ * per-task delay to 15 min, because higher values violate Amazon's permanent
+ * 1/15-min limit on createReport for this report type. If the caller passes
+ * less-conservative values, a warning is logged and the floor wins.
+ *
+ * Pass `existingKeys` (formatted as `${marketplaceId}|${YYYY-MM-DD}`) to skip
+ * (marketplace, day) pairs that are already present in brain.sales_traffic_daily.
  */
 export async function backfillSalesTraffic(opts: {
   spClient: SpApiClient;
@@ -243,8 +255,27 @@ export async function backfillSalesTraffic(opts: {
   toDate: Date;
   concurrency?: number;
   delayMs?: number;
+  existingKeys?: Set<string>;
   onProgress?: (info: { day: string; marketplace: string; rows: number; done: number; total: number }) => void;
-}): Promise<{ totalDays: number; totalRows: number }> {
+}): Promise<{ totalDays: number; totalRows: number; tasksRun: number; tasksSkipped: number }> {
+  const requestedConcurrency = opts.concurrency ?? SALES_TRAFFIC_MAX_CONCURRENCY;
+  const requestedDelay = opts.delayMs ?? SALES_TRAFFIC_MIN_DELAY_MS;
+  const effectiveConcurrency = Math.min(requestedConcurrency, SALES_TRAFFIC_MAX_CONCURRENCY);
+  const effectiveDelay = Math.max(requestedDelay, SALES_TRAFFIC_MIN_DELAY_MS);
+
+  if (requestedConcurrency > SALES_TRAFFIC_MAX_CONCURRENCY) {
+    console.warn(
+      `[sales-traffic] concurrency=${requestedConcurrency} requested but Amazon's permanent ` +
+      `1/15-min createReport limit forces 1. Clamping.`,
+    );
+  }
+  if (requestedDelay < SALES_TRAFFIC_MIN_DELAY_MS) {
+    console.warn(
+      `[sales-traffic] delayMs=${requestedDelay} requested but Amazon's permanent ` +
+      `1/15-min createReport limit forces >= ${SALES_TRAFFIC_MIN_DELAY_MS}. Raising.`,
+    );
+  }
+
   const days: Date[] = [];
   for (
     let d = new Date(Date.UTC(opts.fromDate.getUTCFullYear(), opts.fromDate.getUTCMonth(), opts.fromDate.getUTCDate()));
@@ -254,14 +285,23 @@ export async function backfillSalesTraffic(opts: {
     days.push(new Date(d));
   }
 
-  const tasks: Array<{ day: Date; marketplaceId: string }> = [];
+  const allTasks: Array<{ day: Date; marketplaceId: string }> = [];
   for (const day of days) {
     for (const marketplaceId of opts.marketplaceIds) {
-      tasks.push({ day, marketplaceId });
+      allTasks.push({ day, marketplaceId });
     }
   }
 
-  const limit = pLimit(opts.concurrency ?? 3);
+  const tasks = opts.existingKeys
+    ? allTasks.filter((t) => !opts.existingKeys!.has(`${t.marketplaceId}|${t.day.toISOString().slice(0, 10)}`))
+    : allTasks;
+  const tasksSkipped = allTasks.length - tasks.length;
+
+  if (tasks.length === 0) {
+    return { totalDays: days.length, totalRows: 0, tasksRun: 0, tasksSkipped };
+  }
+
+  const limit = pLimit(effectiveConcurrency);
   let totalRows = 0;
   let done = 0;
 
@@ -285,14 +325,12 @@ export async function backfillSalesTraffic(opts: {
           done,
           total: tasks.length,
         });
-        // Throttle: pLimit caps concurrency but not rate. Pause after each task
-        // (except the last) so createReport calls stay under the quota.
-        if (done < tasks.length && (opts.delayMs ?? 0) > 0) {
-          await sleep(opts.delayMs!);
+        if (done < tasks.length) {
+          await sleep(effectiveDelay);
         }
       }),
     ),
   );
 
-  return { totalDays: days.length, totalRows };
+  return { totalDays: days.length, totalRows, tasksRun: tasks.length, tasksSkipped };
 }
