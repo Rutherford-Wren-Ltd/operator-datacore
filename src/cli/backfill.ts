@@ -8,11 +8,18 @@
 //   npm run backfill -- --months 6
 //   npm run backfill -- --from 2024-01-01 --to 2024-03-31
 //   npm run backfill -- --source amazon --report sales-traffic --months 24
-//   npm run backfill -- --concurrency 1 --delay 30000   # gentler on the rate limit
+//   npm run backfill -- --region eu --marketplaces UK --from 2024-10-01 --to 2024-12-31 --skip-existing
+//   npm run backfill -- --skip-existing  # skip (marketplace, day) pairs already in lake
 //
-// SP-API rate limits: the Sales & Traffic createReport quota is low (~1/min).
-// --concurrency caps how many run at once; --delay adds a pause (ms) after each
-// day so we stay under quota. Raise --delay if you hit 429 QuotaExceeded.
+// --marketplaces accepts comma-separated short codes (UK, US, DE, …) or raw
+// marketplace IDs, and must stay inside the chosen --region (cross-region runs
+// require their own refresh token, so issue one CLI invocation per region).
+//
+// SP-API rate limits (confirmed by Amazon 2026-05-26): the createReport quota
+// for GET_SALES_AND_TRAFFIC_REPORT is permanently 1 call per 15 minutes,
+// app-wide. backfillSalesTraffic enforces this with a hard floor; --concurrency
+// and --delay CLI flags cannot weaken it. Plan accordingly: a 24-month UK+US
+// backfill is ~14 days of clock time.
 // ============================================================================
 
 import { parseArgs } from 'node:util';
@@ -20,6 +27,34 @@ import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { backfillSalesTraffic } from '../lib/sp-api/sales-traffic.js';
+
+// Short-code aliases for the marketplace IDs Amazon assigns. Operator types
+// `--marketplaces UK,US`; we resolve to the canonical IDs. Raw IDs are also
+// accepted and pass through unchanged.
+const MARKETPLACE_ALIASES: Record<string, string> = {
+  US: 'ATVPDKIKX0DER',
+  CA: 'A2EUQ1WTGCTBG2',
+  MX: 'A1AM78C64UM0Y8',
+  UK: 'A1F83G8C2ARO7P',
+  GB: 'A1F83G8C2ARO7P',
+  DE: 'A1PA6795UKMFR9',
+  FR: 'A13V1IB3VIYZZH',
+  IT: 'APJ6JRA9NG5V4',
+  ES: 'A1RKKUPIHCS9HS',
+  NL: 'A1805IZSGTT6HS',
+  SE: 'A2NODRKZP88ZB9',
+  PL: 'A1C3SOZRARQ6R3',
+  TR: 'A33AVAJ2PDY3EV',
+  JP: 'A1VC38T7YXB528',
+};
+
+function resolveMarketplaceFilter(raw: string | undefined): string[] | null {
+  if (!raw) return null;
+  return raw.split(',').map((s) => s.trim()).filter(Boolean).map((tok) => {
+    const upper = tok.toUpperCase();
+    return MARKETPLACE_ALIASES[upper] ?? tok;
+  });
+}
 
 interface ParsedArgs {
   source: string;
@@ -30,6 +65,8 @@ interface ParsedArgs {
   concurrency: number;
   delayMs: number;
   region: SpApiRegion | null;
+  marketplaceFilter: string[] | null;
+  skipExisting: boolean;
 }
 
 function parseCliArgs(): ParsedArgs {
@@ -40,9 +77,14 @@ function parseCliArgs(): ParsedArgs {
       months: { type: 'string' },
       from: { type: 'string' },
       to: { type: 'string' },
-      concurrency: { type: 'string', default: '3' },
-      delay: { type: 'string', default: '2000' },
+      // For sales-traffic these CLI values are clamped by backfillSalesTraffic to
+      // honour the permanent 1/15-min limit. Defaults reflect that ceiling so a
+      // bare `npm run backfill` is already safe.
+      concurrency: { type: 'string', default: '1' },
+      delay: { type: 'string', default: '900000' },
       region: { type: 'string' },
+      marketplaces: { type: 'string' },
+      'skip-existing': { type: 'boolean', default: false },
     },
   });
 
@@ -59,7 +101,39 @@ function parseCliArgs(): ParsedArgs {
     region = values.region;
   }
 
-  return { source: values.source!, report: values.report!, months, from, to, concurrency, delayMs, region };
+  return {
+    source: values.source!,
+    report: values.report!,
+    months,
+    from,
+    to,
+    concurrency,
+    delayMs,
+    region,
+    marketplaceFilter: resolveMarketplaceFilter(values.marketplaces),
+    skipExisting: values['skip-existing'] ?? false,
+  };
+}
+
+async function loadExistingKeys(
+  pg: import('pg').Client,
+  marketplaceIds: string[],
+  fromDate: Date,
+  toDate: Date,
+): Promise<Set<string>> {
+  const { rows } = await pg.query<{ marketplace_id: string; metric_date: Date }>(
+    `SELECT DISTINCT marketplace_id, metric_date
+       FROM brain.sales_traffic_daily
+      WHERE marketplace_id = ANY($1)
+        AND metric_date BETWEEN $2 AND $3`,
+    [marketplaceIds, fromDate.toISOString().slice(0, 10), toDate.toISOString().slice(0, 10)],
+  );
+  const keys = new Set<string>();
+  for (const r of rows) {
+    const d = r.metric_date instanceof Date ? r.metric_date.toISOString().slice(0, 10) : String(r.metric_date).slice(0, 10);
+    keys.add(`${r.marketplace_id}|${d}`);
+  }
+  return keys;
 }
 
 async function main(): Promise<void> {
@@ -77,7 +151,19 @@ async function main(): Promise<void> {
   const env = loadEnvForAmazonShared();
   const region: SpApiRegion = args.region ?? env.SP_API_REGION;
   const regionConfig = getSpApiRegionConfig(region, env);
-  const marketplaceIds = regionConfig.marketplaceIds;
+  let marketplaceIds = regionConfig.marketplaceIds;
+
+  if (args.marketplaceFilter) {
+    const outOfRegion = args.marketplaceFilter.filter((id) => !marketplaceIds.includes(id));
+    if (outOfRegion.length > 0) {
+      throw new Error(
+        `--marketplaces requested ${outOfRegion.join(', ')} which are not configured for region ` +
+        `'${region}'. Region ${region} has: ${marketplaceIds.join(', ')}. ` +
+        `Cross-region runs must be issued separately (each region uses its own SP-API refresh token).`,
+      );
+    }
+    marketplaceIds = args.marketplaceFilter;
+  }
 
   // Window: --from/--to take precedence over --months
   let fromDate: Date;
@@ -98,8 +184,9 @@ async function main(): Promise<void> {
   console.log(`  Region:        ${regionConfig.region}`);
   console.log(`  Marketplaces:  ${marketplaceIds.join(', ')}`);
   console.log(`  Window:        ${fromDate.toISOString().slice(0, 10)} → ${toDate.toISOString().slice(0, 10)}`);
-  console.log(`  Concurrency:   ${args.concurrency}`);
-  console.log(`  Delay:         ${args.delayMs}ms between days`);
+  console.log(`  Concurrency:   ${args.concurrency}  (clamped to 1 for sales-traffic)`);
+  console.log(`  Delay:         ${args.delayMs}ms  (clamped to >= 900000 for sales-traffic)`);
+  console.log(`  Skip existing: ${args.skipExisting}`);
   console.log('');
 
   const spClient = new SpApiClient({
@@ -133,7 +220,15 @@ async function main(): Promise<void> {
     );
     const syncRunId = runRows[0]!.sync_run_id;
 
-    // 3. Run the backfill
+    // 3. Optionally load already-ingested (marketplace, day) keys to skip
+    let existingKeys: Set<string> | undefined;
+    if (args.skipExisting) {
+      existingKeys = await loadExistingKeys(pg, marketplaceIds, fromDate, toDate);
+      console.log(`  Skip set:      ${existingKeys.size} (marketplace, day) pairs already present`);
+      console.log('');
+    }
+
+    // 4. Run the backfill
     const startedAt = Date.now();
     const result = await backfillSalesTraffic({
       spClient,
@@ -145,6 +240,7 @@ async function main(): Promise<void> {
       toDate,
       concurrency: args.concurrency,
       delayMs: args.delayMs,
+      ...(existingKeys ? { existingKeys } : {}),
       onProgress: (info) => {
         const pct = ((info.done / info.total) * 100).toFixed(1).padStart(5);
         console.log(`  [${pct}%] ${info.day} ${info.marketplace.padEnd(15)} → ${info.rows} ASIN rows`);
@@ -162,7 +258,10 @@ async function main(): Promise<void> {
     );
 
     console.log('');
-    console.log(`Done in ${durationMin} min. ${result.totalDays} days × ${marketplaceIds.length} marketplaces, ${result.totalRows} ASIN rows upserted.`);
+    console.log(
+      `Done in ${durationMin} min. ${result.tasksRun} call(s) made, ${result.tasksSkipped} skipped, ` +
+      `${result.totalRows} ASIN rows upserted across ${marketplaceIds.length} marketplace(s).`,
+    );
     console.log('Next: run  npm run verify  to compare against Seller Central.');
   } finally {
     await pg.end();
