@@ -121,8 +121,14 @@ async function loadExistingKeys(
   fromDate: Date,
   toDate: Date,
 ): Promise<Set<string>> {
-  const { rows } = await pg.query<{ marketplace_id: string; metric_date: Date }>(
-    `SELECT DISTINCT marketplace_id, metric_date
+  // Cast metric_date to text in SQL so node-postgres never parses it through
+  // its DATE → JS Date converter. That converter builds the Date at LOCAL
+  // midnight, which then shifts back a day when we call .toISOString() in
+  // any non-UTC timezone (BST = -1 day, UTC+1 = -1 day, etc.). The text cast
+  // bypasses the trap entirely; the comparison is now string-vs-string with
+  // the day-based task keys built in UTC below.
+  const { rows } = await pg.query<{ marketplace_id: string; metric_date: string }>(
+    `SELECT DISTINCT marketplace_id, to_char(metric_date, 'YYYY-MM-DD') AS metric_date
        FROM brain.sales_traffic_daily
       WHERE marketplace_id = ANY($1)
         AND metric_date BETWEEN $2 AND $3`,
@@ -130,8 +136,7 @@ async function loadExistingKeys(
   );
   const keys = new Set<string>();
   for (const r of rows) {
-    const d = r.metric_date instanceof Date ? r.metric_date.toISOString().slice(0, 10) : String(r.metric_date).slice(0, 10);
-    keys.add(`${r.marketplace_id}|${d}`);
+    keys.add(`${r.marketplace_id}|${r.metric_date}`);
   }
   return keys;
 }
