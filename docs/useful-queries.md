@@ -312,60 +312,82 @@ WHERE sku = 'MD05GTS';   -- change this
 
 Returns the most recent snapshot row. Only SKUs with actual or inbound inventory appear here (zero-inventory SKUs are filtered at ingest).
 
-### Days-of-cover for one SKU
+### Days-of-cover for one ASIN
+
+All rate-metric queries use `analytics.inventory_health_by_asin` (one row per
+marketplace × ASIN, NewItem condition, fulfillable summed across FNSKUs). The
+per-row `analytics.inventory_health` deliberately drops `days_on_hand_*` — per-row
+stock over per-ASIN velocity is meaningless when an ASIN has multiple bins.
 
 ```sql
 SELECT
-  sku,
   asin,
   country_code,
   afn_fulfillable_quantity,
   afn_inbound_total,
   units_per_day,
   days_on_hand_fulfillable,    -- conservative read (ignores inbound)
-  days_on_hand_with_inbound    -- optimistic read
-FROM analytics.inventory_health
-WHERE sku = 'MD05GTS';   -- change this
+  days_on_hand_with_inbound,   -- optimistic read
+  fnsku_count, sku_alias_count -- > 1 flags phantom / multi-bin ASINs
+FROM analytics.inventory_health_by_asin
+WHERE asin = 'B0F9YZ46ND';   -- change this
 ```
 
-`days_on_hand` is `NULL` when there's no 30-day sales velocity (new SKU, paused, or data lake gap). That's intentional — distinguishes "needs investigation" from "out of stock."
+`days_on_hand_*` is `NULL` when there's no 30-day sales velocity (new ASIN, paused, or data lake gap). That's intentional — distinguishes "needs investigation" from "out of stock."
 
-### SKUs at risk — under 30 days of cover, sorted by urgency
+### ASINs at risk — under 30 days of cover, sorted by urgency
 
 ```sql
 SELECT
   country_code,
-  sku,
   asin,
   product_name,
   afn_fulfillable_quantity,
   units_per_day,
   days_on_hand_fulfillable
-FROM analytics.inventory_health
+FROM analytics.inventory_health_by_asin
 WHERE days_on_hand_fulfillable IS NOT NULL
   AND days_on_hand_fulfillable < 30
 ORDER BY days_on_hand_fulfillable ASC;
 ```
 
-The threshold is operator-specific — bump to 60 / 90 for SKUs with long lead times.
+The threshold is operator-specific — bump to 60 / 90 for ASINs with long lead times.
 
-### Overstock — SKUs with more than 180 days of cover
+### Overstock — ASINs with more than 180 days of cover
 
 ```sql
 SELECT
   country_code,
-  sku,
   asin,
   product_name,
   afn_total_quantity,
   units_per_day,
   days_on_hand_total
-FROM analytics.inventory_health
+FROM analytics.inventory_health_by_asin
 WHERE days_on_hand_total > 180
 ORDER BY days_on_hand_total DESC;
 ```
 
-Useful for spotting capital tied up in slow-moving stock. MD-001's 270-339-day cover (flagged in its first audit) would show up here.
+Useful for spotting capital tied up in slow-moving stock.
+
+### Per-SKU / per-bin inventory (forensic / ops use)
+
+When you need to see every SKU listing or every FC bin for an ASIN (e.g. to find
+phantom listings, audit Used-condition stock, or reconcile against a Seller Central
+manage-inventory screen):
+
+```sql
+SELECT
+  sku, fnsku, asin, condition,
+  afn_fulfillable_quantity, afn_reserved_quantity, afn_inbound_total,
+  sku_count, all_skus
+FROM analytics.inventory_health    -- per (marketplace, fnsku, condition)
+WHERE asin = 'B0F9YZ46ND';
+```
+
+`sku_count > 1` on a row means that FNSKU bin is reported under multiple SKU aliases
+(`all_skus` lists them) — typically phantom listings from a SKU rename. Per-row
+`days_on_hand_*` columns are intentionally absent.
 
 ---
 

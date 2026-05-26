@@ -131,14 +131,16 @@ A SKU whose ASP cannot be read in the same currency as its COGS has its gate **s
 - **"More than 70% of the catalogue is triggering a reorder"** — the run prints this
   warning when the trigger rate is implausibly high. It usually means the inventory
   snapshot or the committed-PO data is stale or wrong. Check
-  `analytics.inventory_health` has a fresh `snapshot_date` and that
-  `brain.po_committed_inventory` looks right before trusting the run.
+  `analytics.inventory_health_by_asin` has a fresh `snapshot_date` (and `lake_age_hours`
+  isn't far above ~24) and that `brain.po_committed_inventory` looks right before
+  trusting the run.
 - **A SKU you expected is in "Skipped — no lead time"** — 57 active SKUs currently have
   no `effective_lead_time_days`. Fill the lead time on the supplier or SKU row and re-run
   `import-masters`; the engine cannot size a planning window without it.
 - **A SKU is on "flat-velocity fallback"** — it has no rows in the demand forecast.
   Add it to the forecasting tool and re-run `import-forecast` for a real seasonal number.
-- **Duplicate-pool warning on a SKU** — two inventory rows for the same ASIN/region have
-  identical quantities, likely SKU aliases for one physical pool. Supply may be
-  double-counted (so the proposal may be too low). Resolve in Seller Central → Manage FBA
-  Inventory.
+- **Duplicate-pool warning on a SKU** — obsolete after migration 0019 (per-FNSKU dedupe
+  at the view level) + 0020 (ASIN-aggregate view). The engine still logs it for
+  defensive completeness but should never fire under the new views. If you see it,
+  inspect `analytics.fba_inventory_per_fnsku` for the ASIN — something has slipped
+  past the dedupe.

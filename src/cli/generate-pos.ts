@@ -193,12 +193,16 @@ async function main(): Promise<void> {
        FROM brain.sku_effective_terms`,
     )).rows;
 
+    // Reads the ASIN-aggregated view (migration 0020). One row per
+    // (marketplace, asin), NewItem-only, fulfillable already summed across
+    // distinct FNSKUs. The per-region aggregation below sums across
+    // marketplaces inside each region (UK_EU = UK+DE+FR+IT+ES, NA = US).
     const inv = (await pg.query<InvRow>(
       `SELECT marketplace_id, btrim(country_code) AS country_code, asin, product_name,
               afn_fulfillable_quantity, afn_reserved_quantity, afn_inbound_total,
               units_per_day::float8 AS units_per_day
-       FROM analytics.inventory_health
-       WHERE snapshot_date = (SELECT max(snapshot_date) FROM analytics.inventory_health)`,
+       FROM analytics.inventory_health_by_asin
+       WHERE snapshot_date = (SELECT max(snapshot_date) FROM analytics.inventory_health_by_asin)`,
     )).rows;
 
     const forecast = (await pg.query<{
