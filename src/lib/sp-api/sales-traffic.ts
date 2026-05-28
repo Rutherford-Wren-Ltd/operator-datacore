@@ -17,6 +17,7 @@ import pLimit from 'p-limit';
 import { Client as PgClient } from 'pg';
 import { SpApiClient } from './client.js';
 import { runReport } from './reports.js';
+import { getPgClient } from '../supabase.js';
 
 export interface SalesTrafficByAsinRow {
   parentAsin: string;
@@ -257,7 +258,20 @@ export async function backfillSalesTraffic(opts: {
   delayMs?: number;
   existingKeys?: Set<string>;
   onProgress?: (info: { day: string; marketplace: string; rows: number; done: number; total: number }) => void;
-}): Promise<{ totalDays: number; totalRows: number; tasksRun: number; tasksSkipped: number }> {
+}): Promise<{
+  totalDays: number;
+  totalRows: number;
+  tasksRun: number;
+  tasksSkipped: number;
+  /**
+   * The active pg client at the end of the run. May not be the same instance
+   * the caller passed in: if a keepalive ping failed mid-run, the original was
+   * closed and replaced with a fresh client. Callers that hold a long-lived pg
+   * reference should reassign to this so any further queries / end() target
+   * the live connection.
+   */
+  pg: PgClient;
+}> {
   const requestedConcurrency = opts.concurrency ?? SALES_TRAFFIC_MAX_CONCURRENCY;
   const requestedDelay = opts.delayMs ?? SALES_TRAFFIC_MIN_DELAY_MS;
   const effectiveConcurrency = Math.min(requestedConcurrency, SALES_TRAFFIC_MAX_CONCURRENCY);
@@ -298,19 +312,26 @@ export async function backfillSalesTraffic(opts: {
   const tasksSkipped = allTasks.length - tasks.length;
 
   if (tasks.length === 0) {
-    return { totalDays: days.length, totalRows: 0, tasksRun: 0, tasksSkipped };
+    return { totalDays: days.length, totalRows: 0, tasksRun: 0, tasksSkipped, pg: opts.pg };
   }
 
   const limit = pLimit(effectiveConcurrency);
   let totalRows = 0;
   let done = 0;
 
+  // The pg connection is held open across 15-minute idle sleeps between calls.
+  // Supabase's pooler kills idle connections, so without a keepalive the run
+  // crashes mid-wave on whichever sleep cycle the pooler decides to evict
+  // (observed 2026-05-27 at ~16 of 92 days). `activePg` is local + mutable so
+  // we can transparently swap in a fresh client when the keepalive ping fails.
+  let activePg: PgClient = opts.pg;
+
   await Promise.all(
     tasks.map((t) =>
       limit(async () => {
         const { rowsUpserted } = await ingestSalesTrafficDay({
           spClient: opts.spClient,
-          pg: opts.pg,
+          pg: activePg,
           connectionId: opts.connectionId,
           syncRunId: opts.syncRunId,
           marketplaceId: t.marketplaceId,
@@ -326,11 +347,40 @@ export async function backfillSalesTraffic(opts: {
           total: tasks.length,
         });
         if (done < tasks.length) {
-          await sleep(effectiveDelay);
+          activePg = await sleepWithKeepalive(effectiveDelay, activePg);
         }
       }),
     ),
   );
 
-  return { totalDays: days.length, totalRows, tasksRun: tasks.length, tasksSkipped };
+  return { totalDays: days.length, totalRows, tasksRun: tasks.length, tasksSkipped, pg: activePg };
+}
+
+/**
+ * Sleep for `totalMs`, pinging `pg` every ~60 seconds to keep the connection
+ * warm. If a ping fails (Supabase's pooler evicted us, network blip, etc.) the
+ * client is replaced with a fresh one and we continue. Returns the
+ * possibly-new pg client so the caller can swap its reference.
+ *
+ * Concurrency is hard-clamped to 1 for this report type, so there's only ever
+ * one pg user at a time — the mutable swap is safe.
+ */
+async function sleepWithKeepalive(totalMs: number, pg: PgClient): Promise<PgClient> {
+  const PING_INTERVAL_MS = 60_000;
+  const start = Date.now();
+  let active = pg;
+  while (Date.now() - start < totalMs) {
+    const remaining = totalMs - (Date.now() - start);
+    await sleep(Math.min(PING_INTERVAL_MS, remaining));
+    if (Date.now() - start >= totalMs) break;
+    try {
+      await active.query('SELECT 1');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`[sales-traffic] keepalive ping failed (${msg}); reconnecting`);
+      try { await active.end(); } catch { /* old client already dead */ }
+      active = await getPgClient();
+    }
+  }
+  return active;
 }

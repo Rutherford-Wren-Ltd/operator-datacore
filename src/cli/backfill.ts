@@ -200,7 +200,10 @@ async function main(): Promise<void> {
     clientSecret: env.SP_API_LWA_CLIENT_SECRET,
     refreshToken: regionConfig.refreshToken,
   });
-  const pg = await getPgClient();
+  // `pg` is reassigned if backfillSalesTraffic's keepalive had to reconnect
+  // mid-run (Supabase pooler eviction or network blip). Anything we touch
+  // post-backfill — the sync_run UPDATE, the finally end() — uses this var.
+  let pg = await getPgClient();
 
   try {
     // 1. Ensure a connection row exists
@@ -253,6 +256,11 @@ async function main(): Promise<void> {
     });
 
     const durationMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
+
+    // Swap to the (possibly reconnected) client backfillSalesTraffic ended up
+    // using. Without this the sync_run UPDATE below would target a dead client
+    // if the original was evicted mid-run.
+    pg = result.pg;
 
     await pg.query(
       `UPDATE meta.sync_run
