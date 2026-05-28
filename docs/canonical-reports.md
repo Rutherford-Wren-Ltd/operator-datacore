@@ -37,7 +37,7 @@ A real client (Dr Bo, May 2026): a dashboard built on Orders-Report-derived reve
 | Inventory ledger movements | `GET_LEDGER_DETAIL_VIEW_DATA` | `brain.inventory_ledger_detail` | Movement | 24h | scaffolded |
 | Catalog (titles, images, ASIN ↔ SKU) | `Catalog Items API → getCatalogItem` | `brain.catalog_items` | On-demand | realtime | scaffolded |
 | Listings (your offers) | `Listings Items API → getListingsItem` | `brain.listings_items` | Per SKU | realtime | scaffolded |
-| Search query performance | `GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT` | `brain.search_query_performance` | Period × ASIN × query | 1 week | scaffolded |
+| Search query performance | `GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT` | `brain.search_query_performance` | Period × ASIN × query | 1 week | **active** (CLI: `npm run backfill-search-query`; daily-sync hook is a Phase 7 follow-up) |
 | Subscribe & Save | `Replenishment API → listOffers` | `brain.subscribe_save_offers` | Offer × day | 24h | scaffolded |
 | Sponsored Products spend | **Amazon Ads API v3** → `spAdvertisedProduct` report | `brain.ads_sp_daily` | Day × campaign × ad group × target | 24-48h | scaffolded |
 | Sponsored Brands spend | **Amazon Ads API v3** → `sbPurchasedProduct` | `brain.ads_sb_daily` | Day | 24-48h | scaffolded |

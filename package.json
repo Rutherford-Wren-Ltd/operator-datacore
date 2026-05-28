@@ -37,6 +37,7 @@
     "backfill": "tsx src/cli/backfill.ts",
     "backfill:amazon": "tsx src/cli/backfill.ts --source amazon",
     "backfill:amazon:sales-traffic": "tsx src/cli/backfill.ts --source amazon --report sales-traffic",
+    "backfill-search-query": "tsx src/cli/backfill-search-query.ts",
     "incremental": "tsx src/cli/backfill.ts --source amazon --report sales-traffic --months 1 --concurrency 2",
     "inventory-snapshot": "tsx src/cli/inventory-snapshot.ts",
     "ads-probe": "tsx src/cli/ads-probe.ts",
