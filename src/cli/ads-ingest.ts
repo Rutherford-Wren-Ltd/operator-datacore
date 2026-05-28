@@ -13,9 +13,17 @@
 //   npm run ads-ingest -- --region NA             # primary-region default, NA override
 //   npm run ads-ingest -- --days 7                # last 7 days, SP + SD
 //   npm run ads-ingest -- --date 2026-05-14       # one specific date
+//   npm run ads-ingest -- --from 2024-01-01 --to 2024-12-31 --skip-existing
+//                                                 # historical backfill, idempotent re-runs
 //   npm run ads-ingest -- --products SP           # SP only
 //   npm run ads-ingest -- --products SD           # SD only
 //   npm run ads-ingest -- --concurrency 3         # 3 profiles in parallel per date (default 1)
+//
+// Backfill mode (--from/--to):
+//   - Hard-capped at 1100 days (~3 years) to avoid an accidental decade-long run.
+//   - Combine with --skip-existing to make re-runs idempotent: any (profile, date)
+//     pair that already has rows in brain.ads_sp_daily or brain.ads_sd_daily is
+//     dropped from the worklist. Use this for crash recovery or topping up gaps.
 //
 // Concurrency:
 //   - SP + SD for one (profile, date) always run in parallel — separate
@@ -68,11 +76,15 @@ async function main(): Promise<void> {
     options: {
       date: { type: 'string' },
       days: { type: 'string' },
+      from: { type: 'string' },
+      to: { type: 'string' },
       products: { type: 'string' },
       region: { type: 'string' },
       concurrency: { type: 'string' },
+      'skip-existing': { type: 'boolean', default: false },
     },
   });
+  const skipExisting = values['skip-existing'] ?? false;
 
   const env = loadEnvForAdsShared();
   const region: AdsApiRegion = (values.region as AdsApiRegion | undefined) ?? env.ADS_API_REGION;
@@ -86,7 +98,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const dates = resolveDates(values.date, values.days);
+  const dates = resolveDates(values.date, values.days, values.from, values.to);
   const products = resolveProducts(values.products);
   const concurrency = resolveConcurrency(values.concurrency);
 
@@ -98,6 +110,7 @@ async function main(): Promise<void> {
   console.log(`  Products:      ${products.join(', ')}`);
   console.log(`  Dates:         ${dates[0]}${dates.length > 1 ? ` … ${dates[dates.length - 1]} (${dates.length} day${dates.length === 1 ? '' : 's'})` : ''}`);
   console.log(`  Concurrency:   ${concurrency} profile${concurrency === 1 ? '' : 's'} in parallel per date`);
+  console.log(`  Skip existing: ${skipExisting}`);
   console.log('');
 
   // Initial client used for the /v2/profiles enumeration. Per-profile
@@ -127,6 +140,26 @@ async function main(): Promise<void> {
     const totals: Record<AdProductKey, number> = { SP: 0, SD: 0 };
     const failures: ProfileDateFailure[] = [];
     let successCount = 0;
+    let skippedCount = 0;
+
+    // For --skip-existing, build a set of (profile_id, date) pairs where ALL
+    // requested products already have rows in the lake. Pairs that are only
+    // partially present (e.g. SP filled, SD missing from an earlier failed
+    // run) stay on the worklist — the upsert below is idempotent for the
+    // already-present product, so re-running them is wasteful but not wrong.
+    const completedPairs = skipExisting
+      ? await loadCompletedPairs(
+          pg,
+          matchedProfiles.map((p) => String(p.profileId)),
+          dates[0]!,
+          dates[dates.length - 1]!,
+          products,
+        )
+      : new Set<string>();
+    if (skipExisting) {
+      console.log(`  Skip set:      ${completedPairs.size} (profile, date) pairs already complete for all requested products`);
+      console.log('');
+    }
 
     // For each date, batch profiles into groups of `concurrency` and run
     // each batch in parallel. Within each batched profile, SP + SD still
@@ -137,12 +170,24 @@ async function main(): Promise<void> {
     // A failure summary is printed at end and exit code reflects whether
     // any profile-dates failed.
     for (const date of dates) {
-      console.log(`Date ${date}:`);
+      const profilesToRun = matchedProfiles.filter(
+        (p) => !completedPairs.has(`${p.profileId}|${date}`),
+      );
+      const skippedThisDate = matchedProfiles.length - profilesToRun.length;
+      if (skippedThisDate > 0) {
+        skippedCount += skippedThisDate;
+      }
+      if (profilesToRun.length === 0) {
+        // Every profile is already complete for this date — quietly skip.
+        continue;
+      }
 
-      for (let i = 0; i < matchedProfiles.length; i += concurrency) {
-        const batch = matchedProfiles.slice(i, i + concurrency);
-        const batchLabel = matchedProfiles.length > concurrency
-          ? `  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(matchedProfiles.length / concurrency)}: ${batch.length} profile${batch.length === 1 ? '' : 's'} in parallel`
+      console.log(`Date ${date}${skippedThisDate > 0 ? ` (${skippedThisDate} profile${skippedThisDate === 1 ? '' : 's'} skipped — already complete)` : ''}:`);
+
+      for (let i = 0; i < profilesToRun.length; i += concurrency) {
+        const batch = profilesToRun.slice(i, i + concurrency);
+        const batchLabel = profilesToRun.length > concurrency
+          ? `  batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(profilesToRun.length / concurrency)}: ${batch.length} profile${batch.length === 1 ? '' : 's'} in parallel`
           : null;
         if (batchLabel) console.log(batchLabel);
 
@@ -181,7 +226,10 @@ async function main(): Promise<void> {
     }
 
     const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-    console.log(`Done in ${durationSec}s. ${successCount} profile-date(s) succeeded, ${failures.length} failed.`);
+    console.log(
+      `Done in ${durationSec}s. ${successCount} profile-date(s) succeeded, ` +
+      `${skippedCount} skipped, ${failures.length} failed.`,
+    );
     for (const p of products) {
       console.log(`  ${p}: ${totals[p]} row(s) total → brain.ads_${p.toLowerCase()}_daily`);
     }
@@ -297,9 +345,98 @@ async function ingestProfileDate(opts: IngestProfileDateOpts): Promise<ProfileDa
   }
 }
 
-function resolveDates(date: string | undefined, days: string | undefined): string[] {
+const ISO_DATE = /^\d{4}-\d{2}-\d{2}$/;
+const MAX_BACKFILL_DAYS = 1100;  // ~3 years, generous ceiling
+
+/**
+ * Find (profile_id, date) pairs that already have rows for EVERY requested
+ * product. A pair is "complete" only if all requested products show data;
+ * pairs that have e.g. SP rows but missing SD rows stay on the worklist so a
+ * partial earlier run can be topped up.
+ *
+ * The metric_date is read via `to_char(..., 'YYYY-MM-DD')` to avoid the
+ * node-postgres DATE → local-midnight Date trap that caused the
+ * sales-traffic --skip-existing bug (operator-datacore #48).
+ */
+async function loadCompletedPairs(
+  pg: PgClient,
+  profileIds: string[],
+  fromDate: string,
+  toDate: string,
+  products: AdProductKey[],
+): Promise<Set<string>> {
+  // Query each product table separately so partial-completion stays visible.
+  // Table names are derived from a controlled enum, not user input — safe.
+  const productSets: Set<string>[] = [];
+  for (const product of products) {
+    const table = product === 'SP' ? 'brain.ads_sp_daily' : 'brain.ads_sd_daily';
+    const { rows } = await pg.query<{ profile_id: string; metric_date: string }>(
+      `SELECT DISTINCT profile_id, to_char(metric_date, 'YYYY-MM-DD') AS metric_date
+         FROM ${table}
+        WHERE profile_id = ANY($1)
+          AND metric_date BETWEEN $2 AND $3`,
+      [profileIds, fromDate, toDate],
+    );
+    productSets.push(new Set(rows.map((r) => `${r.profile_id}|${r.metric_date}`)));
+  }
+  if (productSets.length === 0) return new Set();
+  // A pair is complete only when it appears in every product's set.
+  const [first, ...rest] = productSets;
+  const completed = new Set<string>();
+  for (const key of first!) {
+    if (rest.every((s) => s.has(key))) completed.add(key);
+  }
+  return completed;
+}
+
+function resolveDates(
+  date: string | undefined,
+  days: string | undefined,
+  from: string | undefined,
+  to: string | undefined,
+): string[] {
+  // Mutual exclusion: pick exactly one of --date, --days, or --from/--to.
+  const modes = [
+    date    ? '--date'        : null,
+    days    ? '--days'        : null,
+    (from || to) ? '--from/--to' : null,
+  ].filter(Boolean) as string[];
+  if (modes.length > 1) {
+    throw new Error(`Pick one of: ${modes.join(', ')}. Got all of: ${modes.join(' + ')}.`);
+  }
+
+  // --from/--to: explicit historical window, no upper cap on `--days`.
+  if (from || to) {
+    if (!from || !to) {
+      throw new Error('--from and --to must be used together.');
+    }
+    if (!ISO_DATE.test(from) || !ISO_DATE.test(to)) {
+      throw new Error(`--from and --to must be YYYY-MM-DD. Got "${from}" and "${to}".`);
+    }
+    const fromT = Date.UTC(+from.slice(0, 4), +from.slice(5, 7) - 1, +from.slice(8, 10));
+    const toT   = Date.UTC(+to.slice(0, 4),   +to.slice(5, 7) - 1,   +to.slice(8, 10));
+    if (toT < fromT) {
+      throw new Error(`--to (${to}) is before --from (${from}).`);
+    }
+    const ms = toT - fromT + 86_400_000;
+    const total = Math.round(ms / 86_400_000);
+    if (total > MAX_BACKFILL_DAYS) {
+      throw new Error(
+        `Backfill range is ${total} days; capped at ${MAX_BACKFILL_DAYS}. ` +
+        `Split into smaller windows or raise MAX_BACKFILL_DAYS in src/cli/ads-ingest.ts.`,
+      );
+    }
+    const out: string[] = [];
+    for (let t = fromT; t <= toT; t += 86_400_000) {
+      out.push(new Date(t).toISOString().slice(0, 10));
+    }
+    return out;
+  }
+
   if (date) return [date];
 
+  // --days: trailing N days ending yesterday. Same 30-day cap as before —
+  // the larger backfill case is --from/--to, not --days.
   const n = days ? Math.max(1, Math.min(30, parseInt(days, 10))) : 1;
   const out: string[] = [];
   const now = new Date();
