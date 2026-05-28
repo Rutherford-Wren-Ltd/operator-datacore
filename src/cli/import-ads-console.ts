@@ -500,9 +500,35 @@ async function main(): Promise<void> {
 
   const pg = await getPgClient();
   try {
-    let upserts = 0;
     const sourceFile = basename(args.file);
-    for (const p of prepared) {
+    // Batched multi-VALUES INSERT. 21 params per row × 1000 rows = 21,000
+    // params per batch; well under Postgres's 65,535 limit. Round-trip
+    // count drops by 1000× vs the per-row INSERT; for a 1M row import
+    // that's ~3-5 min instead of ~10 hours over Supabase latency.
+    const BATCH_SIZE = 1000;
+    const PROGRESS_EVERY = 10;  // log every Nth batch
+    const startedAt = Date.now();
+    let upserts = 0;
+
+    for (let batchIdx = 0; batchIdx < prepared.length; batchIdx += BATCH_SIZE) {
+      const batch = prepared.slice(batchIdx, batchIdx + BATCH_SIZE);
+      const params: unknown[] = [];
+      const valuesClauses: string[] = [];
+      for (const p of batch) {
+        const i = params.length;
+        params.push(
+          p.metric_date, p.profile_id, p.profile_label, p.region, args.adProduct,
+          p.portfolio_name, p.campaign_id, p.campaign_name, p.campaign_status,
+          p.targeting_type, p.bidding_strategy, p.currency_code,
+          p.impressions, p.clicks, p.spend, p.orders, p.sales, p.units,
+          JSON.stringify(p.raw_csv), args.batchId, sourceFile,
+        );
+        const placeholders = Array.from({ length: 21 }, (_, k) => `$${i + k + 1}`);
+        // Index 18 (zero-based) is raw_csv → ::jsonb cast.
+        placeholders[18] = `${placeholders[18]}::jsonb`;
+        valuesClauses.push(`(${placeholders.join(',')})`);
+      }
+
       await pg.query(
         `INSERT INTO brain.ads_campaign_history_imported (
             metric_date, profile_id, profile_label, region, ad_product,
@@ -510,13 +536,7 @@ async function main(): Promise<void> {
             targeting_type, bidding_strategy, currency_code,
             impressions, clicks, spend, orders, sales, units,
             raw_csv, import_batch_id, source_file
-         ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8, $9,
-            $10, $11, $12,
-            $13, $14, $15, $16, $17, $18,
-            $19::jsonb, $20, $21
-         )
+         ) VALUES ${valuesClauses.join(',')}
          ON CONFLICT (metric_date, profile_id, ad_product, campaign_name) DO UPDATE SET
             profile_label    = EXCLUDED.profile_label,
             region           = EXCLUDED.region,
@@ -536,17 +556,22 @@ async function main(): Promise<void> {
             import_batch_id  = EXCLUDED.import_batch_id,
             source_file      = EXCLUDED.source_file,
             imported_at      = NOW()`,
-        [
-          p.metric_date, p.profile_id, p.profile_label, p.region, args.adProduct,
-          p.portfolio_name, p.campaign_id, p.campaign_name, p.campaign_status,
-          p.targeting_type, p.bidding_strategy, p.currency_code,
-          p.impressions, p.clicks, p.spend, p.orders, p.sales, p.units,
-          JSON.stringify(p.raw_csv), args.batchId, sourceFile,
-        ],
+        params,
       );
-      upserts++;
+
+      upserts += batch.length;
+      const batchNum = Math.floor(batchIdx / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(prepared.length / BATCH_SIZE);
+      if (batchNum % PROGRESS_EVERY === 0 || batchNum === totalBatches) {
+        const pct = ((upserts / prepared.length) * 100).toFixed(1).padStart(5);
+        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(0);
+        const rate = Math.round(upserts / Math.max(1, (Date.now() - startedAt) / 1000));
+        console.log(`  [${pct}%] batch ${batchNum}/${totalBatches} — ${upserts.toLocaleString()} rows upserted (${rate.toLocaleString()} rows/s, ${elapsed}s elapsed)`);
+      }
     }
-    console.log(`Done. ${upserts} row(s) upserted into brain.ads_campaign_history_imported (batch_id ${args.batchId}).`);
+    const totalSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+    console.log('');
+    console.log(`Done in ${totalSec}s. ${upserts.toLocaleString()} row(s) upserted into brain.ads_campaign_history_imported (batch_id ${args.batchId}).`);
   } finally {
     await pg.end();
   }
