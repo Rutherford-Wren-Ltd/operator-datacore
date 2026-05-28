@@ -133,7 +133,39 @@ async function main(): Promise<void> {
     );
   }
 
-  const pg = await getPgClient();
+  // `activePg` is the live pg client. It may be swapped under us by the
+  // keepalive heartbeat below if Supabase's pooler evicts the connection
+  // during a long-running backfill (~9 min per profile-date, most of which
+  // is spent polling Amazon with the pg connection idle). Every reference
+  // below goes through `activePg` rather than a stable `pg` const, so the
+  // swap takes effect on the next query.
+  let activePg = await getPgClient();
+
+  // Heartbeat: ping the active pg client every ~60s. If it throws, the
+  // connection is dead — close it (best-effort) and replace with a fresh
+  // one. Concurrency note: the heartbeat and the main flow share one pg
+  // connection; node-postgres serialises queries on a single client, so
+  // a heartbeat ping that fires while an upsert is in progress just queues
+  // behind it. No race.
+  //
+  // setInterval doesn't await previous ticks; if a ping is in flight when
+  // the next tick fires, we'd queue a second ping. The serialisation above
+  // makes that benign (queued ping just becomes a no-op once the first
+  // completes), and reconnection is idempotent (multiple .end()s on a
+  // dead client throw, swallowed by the catch).
+  const KEEPALIVE_INTERVAL_MS = 60_000;
+  const heartbeat = setInterval(() => {
+    void (async () => {
+      try {
+        await activePg.query('SELECT 1');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[ads-ingest] keepalive ping failed (${msg}); reconnecting`);
+        try { await activePg.end(); } catch { /* old client already dead */ }
+        activePg = await getPgClient();
+      }
+    })();
+  }, KEEPALIVE_INTERVAL_MS);
 
   try {
     const startedAt = Date.now();
@@ -149,7 +181,7 @@ async function main(): Promise<void> {
     // already-present product, so re-running them is wasteful but not wrong.
     const completedPairs = skipExisting
       ? await loadCompletedPairs(
-          pg,
+          activePg,
           matchedProfiles.map((p) => String(p.profileId)),
           dates[0]!,
           dates[dates.length - 1]!,
@@ -199,7 +231,7 @@ async function main(): Promise<void> {
               env,
               config,
               products,
-              pg,
+              pg: activePg,
             }),
           ),
         );
@@ -251,7 +283,8 @@ async function main(): Promise<void> {
 
     console.log('Next: /sku-audit will produce a real TACoS score for advertised ASINs.');
   } finally {
-    await pg.end();
+    clearInterval(heartbeat);
+    try { await activePg.end(); } catch { /* may already be ended by a recent eviction */ }
   }
 }
 
