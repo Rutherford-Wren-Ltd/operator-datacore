@@ -1,0 +1,434 @@
+#!/usr/bin/env tsx
+// ============================================================================
+// import-ads-console.ts
+// Import campaign-level Amazon Ads history from a manual Ads Console CSV
+// export. Lands rows in brain.ads_campaign_history_imported.
+//
+// Why this exists:
+//   The Ads API only retains advertised-product reports for 65-95 days
+//   (see [[amazon-ads-api-retention]]). The Ads Console web UI export
+//   gives campaign-level data going back ~2 years (SP/SD) or ~1 year (SB),
+//   filling the long-tail window the API can't reach. Less granular than
+//   brain.ads_sp_daily (no per-ASIN), but enough for YoY ACoS / TACoS /
+//   spend-trend analysis.
+//
+// Usage:
+//   npm run import-ads-console -- \
+//     --file "C:/path/to/SP-Campaign-Report.csv" \
+//     --profile-id 567327329024034 \
+//     --profile-label "Emporium Cookshop & Homewares (UK)" \
+//     --region EU \
+//     --ad-product SP \
+//     --batch-id 2026-05-28-uk-sp-24mo
+//
+// One CSV per invocation. Run once per (profile × ad-product) combination.
+// The --batch-id ties multiple invocations together for audit / re-import.
+//
+// Add --dry-run to inspect what would land without writing.
+// ============================================================================
+
+import { parseArgs } from 'node:util';
+import { readFileSync, existsSync } from 'node:fs';
+import { basename } from 'node:path';
+import { getPgClient } from '../lib/supabase.js';
+
+type AdProduct = 'SP' | 'SD' | 'SB';
+
+interface ParsedArgs {
+  file: string;
+  profileId: string;
+  profileLabel: string | null;
+  region: string | null;
+  adProduct: AdProduct;
+  batchId: string;
+  dryRun: boolean;
+}
+
+function parseCliArgs(): ParsedArgs {
+  const { values } = parseArgs({
+    options: {
+      file:            { type: 'string' },
+      'profile-id':    { type: 'string' },
+      'profile-label': { type: 'string' },
+      region:          { type: 'string' },
+      'ad-product':    { type: 'string' },
+      'batch-id':      { type: 'string' },
+      'dry-run':       { type: 'boolean', default: false },
+    },
+  });
+
+  if (!values.file)         throw new Error('--file is required (path to the Ads Console CSV export)');
+  if (!values['profile-id']) throw new Error('--profile-id is required (Amazon Ads profile id this CSV is for)');
+  if (!values['ad-product']) throw new Error('--ad-product is required (SP | SD | SB)');
+  if (!values['batch-id'])   throw new Error('--batch-id is required (free-form tag for this import; e.g. 2026-05-28-uk-sp-24mo)');
+
+  const ap = values['ad-product'].toUpperCase();
+  if (ap !== 'SP' && ap !== 'SD' && ap !== 'SB') {
+    throw new Error(`--ad-product must be one of: SP, SD, SB. Got "${values['ad-product']}".`);
+  }
+  if (!existsSync(values.file)) throw new Error(`File not found: ${values.file}`);
+
+  return {
+    file: values.file,
+    profileId: values['profile-id'],
+    profileLabel: values['profile-label'] ?? null,
+    region: values.region ?? null,
+    adProduct: ap,
+    batchId: values['batch-id'],
+    dryRun: values['dry-run'] ?? false,
+  };
+}
+
+// ----------------------------------------------------------------------------
+// CSV parsing — handles BOM, quoted fields with commas / escaped quotes.
+// Copied/adapted from import-masters.ts to keep the import-CLI family
+// consistent.
+// ----------------------------------------------------------------------------
+function parseCSVLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (c === ',' && !inQuotes) {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out.map(s => s.trim());
+}
+
+function parseCSV(content: string): { header: string[]; rows: string[][] } {
+  // eslint-disable-next-line no-irregular-whitespace
+  const stripped = content.replace(/^﻿/, '');
+  const lines = stripped.split(/\r?\n/).filter(l => l.trim().length > 0);
+  if (lines.length === 0) throw new Error('CSV is empty');
+  return { header: parseCSVLine(lines[0]!), rows: lines.slice(1).map(parseCSVLine) };
+}
+
+// ----------------------------------------------------------------------------
+// Header normalisation: Amazon Ads Console uses headers like "7-Day Total
+// Orders (#)" — we lowercase, replace non-alphanumerics with underscores,
+// collapse repeated underscores, and trim ends. The result is what lands
+// as JSONB keys in raw_csv, and what we look up in TYPED_COLUMN_ALIASES.
+// ----------------------------------------------------------------------------
+function normaliseHeader(h: string): string {
+  return h
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
+// Map of typed column → list of normalised header aliases the Console
+// uses. Order matters within each list (first match wins). Reports from
+// SP / SD / SB differ in attribution windows, so we accept multiple
+// variants — sales / orders / units in particular have 7-day vs 14-day
+// flavours depending on product.
+const TYPED_COLUMN_ALIASES = {
+  metric_date:      ['date', 'day', 'start_date'],
+  campaign_id:      ['campaign_id'],
+  campaign_name:    ['campaign_name', 'campaign'],
+  campaign_status:  ['campaign_status', 'state', 'status'],
+  portfolio_name:   ['portfolio_name', 'portfolio'],
+  targeting_type:   ['targeting_type', 'targeting'],
+  bidding_strategy: ['bidding_strategy', 'bid_strategy'],
+  currency_code:    ['currency', 'currency_code'],
+  impressions:      ['impressions'],
+  clicks:           ['clicks'],
+  spend:            ['spend', 'total_spend', 'cost', 'ad_spend'],
+  orders: [
+    '7_day_total_orders',
+    '14_day_total_orders',
+    '7_day_total_orders_number',     // some exports include the (#) literally
+    '14_day_total_orders_number',
+    'total_orders',
+    'orders',
+  ],
+  sales: [
+    '7_day_total_sales',
+    '14_day_total_sales',
+    'total_sales',
+    'sales',
+  ],
+  units: [
+    '7_day_total_units',
+    '14_day_total_units',
+    '7_day_total_units_number',
+    '14_day_total_units_number',
+    'total_units',
+    'units',
+    'units_sold',
+  ],
+} as const;
+
+type TypedColumn = keyof typeof TYPED_COLUMN_ALIASES;
+
+/**
+ * Build a map from typed column name to the actual normalised CSV header
+ * that should populate it. Logs unmatched typed columns as warnings so
+ * the operator can see what's missing in their export.
+ */
+function buildHeaderMap(headers: string[]): {
+  typed: Partial<Record<TypedColumn, string>>;
+  warnings: string[];
+} {
+  const present = new Set(headers);
+  const typed: Partial<Record<TypedColumn, string>> = {};
+  const warnings: string[] = [];
+
+  for (const [typedCol, aliases] of Object.entries(TYPED_COLUMN_ALIASES)) {
+    const match = aliases.find((a) => present.has(a));
+    if (match) {
+      typed[typedCol as TypedColumn] = match;
+    } else if (typedCol === 'metric_date' || typedCol === 'campaign_name') {
+      // Hard-required columns. Anything else is informational.
+      throw new Error(
+        `CSV is missing a required column for "${typedCol}". Tried: ${aliases.join(', ')}. ` +
+        `Detected headers: ${headers.join(', ')}.`,
+      );
+    } else {
+      warnings.push(
+        `[warn] No header matched typed column "${typedCol}". Searched: ${aliases.join(', ')}. ` +
+        `This field will be NULL for every row.`,
+      );
+    }
+  }
+  return { typed, warnings };
+}
+
+// ----------------------------------------------------------------------------
+// Field parsing — Amazon Ads Console values are messy. Currency cells have
+// symbols ("£123.45"), integers have thousands separators ("1,234"), empty
+// cells mean NULL.
+// ----------------------------------------------------------------------------
+function parseDate(raw: string): string | null {
+  if (!raw) return null;
+  // Ads Console exports dates as ISO (2024-12-31) or US format
+  // (12/31/2024). Detect and normalise.
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const usMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (usMatch) {
+    const [, m, d, y] = usMatch;
+    return `${y}-${m!.padStart(2, '0')}-${d!.padStart(2, '0')}`;
+  }
+  // Fall through: let Postgres complain if it's something else.
+  return raw;
+}
+
+function parseNumber(raw: string): number | null {
+  if (!raw) return null;
+  // Strip currency symbols, percent signs, thousands separators.
+  const cleaned = raw.replace(/[£$€¥,%\s]/g, '');
+  if (cleaned === '' || cleaned === '-') return null;
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseInteger(raw: string): number | null {
+  const n = parseNumber(raw);
+  if (n === null) return null;
+  return Math.round(n);
+}
+
+// ----------------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------------
+async function main(): Promise<void> {
+  const args = parseCliArgs();
+
+  console.log('operator-datacore — Ads Console import');
+  console.log('---------------------------------------');
+  console.log(`  File:          ${args.file}`);
+  console.log(`  Profile id:    ${args.profileId}`);
+  console.log(`  Profile label: ${args.profileLabel ?? '(none)'}`);
+  console.log(`  Region:        ${args.region ?? '(unset)'}`);
+  console.log(`  Ad product:    ${args.adProduct}`);
+  console.log(`  Batch id:      ${args.batchId}`);
+  console.log(`  Dry run:       ${args.dryRun}`);
+  console.log('');
+
+  const raw = readFileSync(args.file, 'utf8');
+  const { header, rows } = parseCSV(raw);
+  const normalised = header.map(normaliseHeader);
+
+  console.log(`Detected ${header.length} columns:`);
+  header.forEach((h, i) => console.log(`  ${(i + 1).toString().padStart(2)}. "${h}" → ${normalised[i]}`));
+  console.log('');
+
+  const { typed, warnings } = buildHeaderMap(normalised);
+  if (warnings.length > 0) {
+    for (const w of warnings) console.warn(w);
+    console.log('');
+  }
+  console.log('Typed-column mapping:');
+  for (const [k, v] of Object.entries(typed)) {
+    console.log(`  ${k.padEnd(18)} ← ${v}`);
+  }
+  console.log('');
+
+  // Build typed row + raw_csv (JSONB) per input row.
+  interface Prepared {
+    metric_date: string;
+    campaign_name: string;
+    campaign_id: string | null;
+    campaign_status: string | null;
+    portfolio_name: string | null;
+    targeting_type: string | null;
+    bidding_strategy: string | null;
+    currency_code: string | null;
+    impressions: number | null;
+    clicks: number | null;
+    spend: number | null;
+    orders: number | null;
+    sales: number | null;
+    units: number | null;
+    raw_csv: Record<string, string>;
+  }
+
+  const prepared: Prepared[] = [];
+  const errors: Array<{ rowNum: number; message: string }> = [];
+
+  for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
+    const row = rows[rowIdx]!;
+    if (row.length === 1 && row[0] === '') continue;  // skip blank line
+
+    const lookup = (typedCol: TypedColumn): string => {
+      const alias = typed[typedCol];
+      if (!alias) return '';
+      const colIdx = normalised.indexOf(alias);
+      if (colIdx < 0) return '';
+      return row[colIdx] ?? '';
+    };
+
+    const rawCsv: Record<string, string> = {};
+    normalised.forEach((h, i) => { rawCsv[h] = row[i] ?? ''; });
+
+    const dateRaw = lookup('metric_date');
+    const date = parseDate(dateRaw);
+    const campaignName = lookup('campaign_name');
+
+    if (!date) {
+      errors.push({ rowNum: rowIdx + 2, message: `empty/invalid date: "${dateRaw}"` });
+      continue;
+    }
+    if (!campaignName) {
+      errors.push({ rowNum: rowIdx + 2, message: `empty campaign_name` });
+      continue;
+    }
+
+    prepared.push({
+      metric_date: date,
+      campaign_name: campaignName,
+      campaign_id:      lookup('campaign_id') || null,
+      campaign_status:  lookup('campaign_status') || null,
+      portfolio_name:   lookup('portfolio_name') || null,
+      targeting_type:   lookup('targeting_type') || null,
+      bidding_strategy: lookup('bidding_strategy') || null,
+      currency_code:    lookup('currency_code') || null,
+      impressions: parseInteger(lookup('impressions')),
+      clicks:      parseInteger(lookup('clicks')),
+      spend:       parseNumber(lookup('spend')),
+      orders:      parseInteger(lookup('orders')),
+      sales:       parseNumber(lookup('sales')),
+      units:       parseInteger(lookup('units')),
+      raw_csv: rawCsv,
+    });
+  }
+
+  console.log(`Parsed ${prepared.length} valid row(s) out of ${rows.length}; ${errors.length} skipped.`);
+  if (errors.length > 0) {
+    console.log('First 5 skipped rows:');
+    for (const e of errors.slice(0, 5)) console.log(`  row ${e.rowNum}: ${e.message}`);
+  }
+  console.log('');
+
+  // Date range summary
+  if (prepared.length > 0) {
+    const dates = prepared.map((p) => p.metric_date).sort();
+    console.log(`Date range: ${dates[0]} → ${dates[dates.length - 1]} (${new Set(dates).size} distinct days)`);
+    const campaigns = new Set(prepared.map((p) => p.campaign_name));
+    console.log(`Campaigns:  ${campaigns.size}`);
+    const totalSpend = prepared.reduce((s, p) => s + (p.spend ?? 0), 0);
+    const totalSales = prepared.reduce((s, p) => s + (p.sales ?? 0), 0);
+    console.log(`Spend sum:  ${totalSpend.toFixed(2)} ${prepared[0]!.currency_code ?? ''}`);
+    console.log(`Sales sum:  ${totalSales.toFixed(2)} ${prepared[0]!.currency_code ?? ''}`);
+    console.log('');
+  }
+
+  if (args.dryRun) {
+    console.log('--dry-run set — nothing written. Re-run without --dry-run to commit.');
+    return;
+  }
+  if (prepared.length === 0) {
+    console.log('No valid rows to import.');
+    return;
+  }
+
+  const pg = await getPgClient();
+  try {
+    let upserts = 0;
+    const sourceFile = basename(args.file);
+    for (const p of prepared) {
+      await pg.query(
+        `INSERT INTO brain.ads_campaign_history_imported (
+            metric_date, profile_id, profile_label, region, ad_product,
+            portfolio_name, campaign_id, campaign_name, campaign_status,
+            targeting_type, bidding_strategy, currency_code,
+            impressions, clicks, spend, orders, sales, units,
+            raw_csv, import_batch_id, source_file
+         ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6, $7, $8, $9,
+            $10, $11, $12,
+            $13, $14, $15, $16, $17, $18,
+            $19::jsonb, $20, $21
+         )
+         ON CONFLICT (metric_date, profile_id, ad_product, campaign_name) DO UPDATE SET
+            profile_label    = EXCLUDED.profile_label,
+            region           = EXCLUDED.region,
+            portfolio_name   = EXCLUDED.portfolio_name,
+            campaign_id      = COALESCE(EXCLUDED.campaign_id, brain.ads_campaign_history_imported.campaign_id),
+            campaign_status  = EXCLUDED.campaign_status,
+            targeting_type   = EXCLUDED.targeting_type,
+            bidding_strategy = EXCLUDED.bidding_strategy,
+            currency_code    = EXCLUDED.currency_code,
+            impressions      = EXCLUDED.impressions,
+            clicks           = EXCLUDED.clicks,
+            spend            = EXCLUDED.spend,
+            orders           = EXCLUDED.orders,
+            sales            = EXCLUDED.sales,
+            units            = EXCLUDED.units,
+            raw_csv          = EXCLUDED.raw_csv,
+            import_batch_id  = EXCLUDED.import_batch_id,
+            source_file      = EXCLUDED.source_file,
+            imported_at      = NOW()`,
+        [
+          p.metric_date, args.profileId, args.profileLabel, args.region, args.adProduct,
+          p.portfolio_name, p.campaign_id, p.campaign_name, p.campaign_status,
+          p.targeting_type, p.bidding_strategy, p.currency_code,
+          p.impressions, p.clicks, p.spend, p.orders, p.sales, p.units,
+          JSON.stringify(p.raw_csv), args.batchId, sourceFile,
+        ],
+      );
+      upserts++;
+    }
+    console.log(`Done. ${upserts} row(s) upserted into brain.ads_campaign_history_imported (batch_id ${args.batchId}).`);
+  } finally {
+    await pg.end();
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
