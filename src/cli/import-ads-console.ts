@@ -34,14 +34,57 @@ import { getPgClient } from '../lib/supabase.js';
 
 type AdProduct = 'SP' | 'SD' | 'SB';
 
-interface ParsedArgs {
-  file: string;
+interface CountryMapping {
   profileId: string;
   profileLabel: string | null;
   region: string | null;
+}
+
+interface ParsedArgs {
+  file: string;
+  // Single-profile mode (one file per profile):
+  profileId: string | null;
+  profileLabel: string | null;
+  region: string | null;
+  // Multi-country mode (one file containing rows from many profiles):
+  countryMap: Map<string, CountryMapping> | null;
   adProduct: AdProduct;
   batchId: string;
   dryRun: boolean;
+}
+
+/**
+ * Parse --country-map "United Kingdom:567...:EU,United States:863...:NA".
+ *
+ * Country name comes first (Amazon Ads Console exports use the full name
+ * verbatim, e.g. "United Kingdom" not "GB"). Profile id and region follow,
+ * colon-separated. Country entries are comma-separated.
+ *
+ * Country names are matched case-insensitively to be forgiving — Amazon
+ * has been inconsistent across exports ("United Kingdom" vs "United
+ * kingdom" historically).
+ */
+function parseCountryMap(raw: string): Map<string, CountryMapping> {
+  const map = new Map<string, CountryMapping>();
+  for (const entry of raw.split(',').map((s) => s.trim()).filter(Boolean)) {
+    const parts = entry.split(':');
+    if (parts.length < 2 || parts.length > 3) {
+      throw new Error(
+        `--country-map entry "${entry}" is malformed. Expected "CountryName:profileId" or "CountryName:profileId:Region".`,
+      );
+    }
+    const [country, profileId, region] = parts;
+    if (!country || !profileId) {
+      throw new Error(`--country-map entry "${entry}" has empty country or profileId.`);
+    }
+    map.set(country.toLowerCase(), {
+      profileId: profileId.trim(),
+      profileLabel: null,
+      region: region?.trim() || null,
+    });
+  }
+  if (map.size === 0) throw new Error('--country-map is empty.');
+  return map;
 }
 
 function parseCliArgs(): ParsedArgs {
@@ -51,6 +94,7 @@ function parseCliArgs(): ParsedArgs {
       'profile-id':    { type: 'string' },
       'profile-label': { type: 'string' },
       region:          { type: 'string' },
+      'country-map':   { type: 'string' },
       'ad-product':    { type: 'string' },
       'batch-id':      { type: 'string' },
       'dry-run':       { type: 'boolean', default: false },
@@ -58,9 +102,17 @@ function parseCliArgs(): ParsedArgs {
   });
 
   if (!values.file)         throw new Error('--file is required (path to the Ads Console CSV export)');
-  if (!values['profile-id']) throw new Error('--profile-id is required (Amazon Ads profile id this CSV is for)');
   if (!values['ad-product']) throw new Error('--ad-product is required (SP | SD | SB)');
   if (!values['batch-id'])   throw new Error('--batch-id is required (free-form tag for this import; e.g. 2026-05-28-uk-sp-24mo)');
+
+  const hasProfile = !!values['profile-id'];
+  const hasCountryMap = !!values['country-map'];
+  if (hasProfile && hasCountryMap) {
+    throw new Error('Use either --profile-id (single-profile export) or --country-map (multi-country export), not both.');
+  }
+  if (!hasProfile && !hasCountryMap) {
+    throw new Error('Either --profile-id or --country-map is required.');
+  }
 
   const ap = values['ad-product'].toUpperCase();
   if (ap !== 'SP' && ap !== 'SD' && ap !== 'SB') {
@@ -70,9 +122,10 @@ function parseCliArgs(): ParsedArgs {
 
   return {
     file: values.file,
-    profileId: values['profile-id'],
+    profileId: values['profile-id'] ?? null,
     profileLabel: values['profile-label'] ?? null,
     region: values.region ?? null,
+    countryMap: hasCountryMap ? parseCountryMap(values['country-map']!) : null,
     adProduct: ap,
     batchId: values['batch-id'],
     dryRun: values['dry-run'] ?? false,
@@ -136,6 +189,7 @@ function normaliseHeader(h: string): string {
 // flavours depending on product.
 const TYPED_COLUMN_ALIASES = {
   metric_date:      ['date', 'day', 'start_date'],
+  country:          ['country', 'country_code', 'marketplace'],
   campaign_id:      ['campaign_id'],
   campaign_name:    ['campaign_name', 'campaign'],
   campaign_status:  ['campaign_status', 'state', 'status'],
@@ -211,15 +265,28 @@ function buildHeaderMap(headers: string[]): {
 // symbols ("£123.45"), integers have thousands separators ("1,234"), empty
 // cells mean NULL.
 // ----------------------------------------------------------------------------
+const MONTH_NAMES: Record<string, string> = {
+  jan: '01', feb: '02', mar: '03', apr: '04', may: '05', jun: '06',
+  jul: '07', aug: '08', sep: '09', oct: '10', nov: '11', dec: '12',
+};
+
 function parseDate(raw: string): string | null {
   if (!raw) return null;
-  // Ads Console exports dates as ISO (2024-12-31) or US format
-  // (12/31/2024). Detect and normalise.
+  // ISO (2024-12-31).
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  // US slash (12/31/2024).
   const usMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
   if (usMatch) {
     const [, m, d, y] = usMatch;
     return `${y}-${m!.padStart(2, '0')}-${d!.padStart(2, '0')}`;
+  }
+  // Long form ("Jun 01, 2023" or "Jun 1, 2023") — what Amazon Ads
+  // Console emits for Sponsored Products campaign exports.
+  const longMatch = raw.match(/^([A-Za-z]{3})\s+(\d{1,2}),\s+(\d{4})$/);
+  if (longMatch) {
+    const [, monthStr, d, y] = longMatch;
+    const mNum = MONTH_NAMES[monthStr!.toLowerCase()];
+    if (mNum) return `${y}-${mNum}-${d!.padStart(2, '0')}`;
   }
   // Fall through: let Postgres complain if it's something else.
   return raw;
@@ -249,9 +316,18 @@ async function main(): Promise<void> {
   console.log('operator-datacore — Ads Console import');
   console.log('---------------------------------------');
   console.log(`  File:          ${args.file}`);
-  console.log(`  Profile id:    ${args.profileId}`);
-  console.log(`  Profile label: ${args.profileLabel ?? '(none)'}`);
-  console.log(`  Region:        ${args.region ?? '(unset)'}`);
+  if (args.countryMap) {
+    console.log(`  Mode:          multi-country (per-row resolution via Country column)`);
+    console.log(`  Country map:   ${args.countryMap.size} country/countries configured`);
+    for (const [country, m] of args.countryMap) {
+      console.log(`    "${country}" → profile ${m.profileId} (region ${m.region ?? '(unset)'})`);
+    }
+  } else {
+    console.log(`  Mode:          single-profile`);
+    console.log(`  Profile id:    ${args.profileId}`);
+    console.log(`  Profile label: ${args.profileLabel ?? '(none)'}`);
+    console.log(`  Region:        ${args.region ?? '(unset)'}`);
+  }
   console.log(`  Ad product:    ${args.adProduct}`);
   console.log(`  Batch id:      ${args.batchId}`);
   console.log(`  Dry run:       ${args.dryRun}`);
@@ -270,15 +346,27 @@ async function main(): Promise<void> {
     for (const w of warnings) console.warn(w);
     console.log('');
   }
+  if (args.countryMap && !typed.country) {
+    throw new Error(
+      `--country-map set, but CSV has no header matching the country column ` +
+      `(searched: country, country_code, marketplace). ` +
+      `Either drop --country-map and import per-file, or check the export.`,
+    );
+  }
   console.log('Typed-column mapping:');
   for (const [k, v] of Object.entries(typed)) {
     console.log(`  ${k.padEnd(18)} ← ${v}`);
   }
   console.log('');
 
-  // Build typed row + raw_csv (JSONB) per input row.
+  // Build typed row + raw_csv (JSONB) per input row. profile_id /
+  // profile_label / region land per-row so the multi-country case carries
+  // distinct values without changing the SQL shape downstream.
   interface Prepared {
     metric_date: string;
+    profile_id: string;
+    profile_label: string | null;
+    region: string | null;
     campaign_name: string;
     campaign_id: string | null;
     campaign_status: string | null;
@@ -297,6 +385,7 @@ async function main(): Promise<void> {
 
   const prepared: Prepared[] = [];
   const errors: Array<{ rowNum: number; message: string }> = [];
+  const unmappedCountries = new Map<string, number>();  // country → row count
 
   for (let rowIdx = 0; rowIdx < rows.length; rowIdx++) {
     const row = rows[rowIdx]!;
@@ -326,8 +415,34 @@ async function main(): Promise<void> {
       continue;
     }
 
+    // Resolve profile per row.
+    let profileId: string;
+    let profileLabel: string | null;
+    let region: string | null;
+    if (args.countryMap) {
+      const country = lookup('country');
+      const mapping = country ? args.countryMap.get(country.toLowerCase()) : undefined;
+      if (!mapping) {
+        // Drop the row from the worklist but tally the country so the
+        // operator can see what was skipped.
+        const key = country || '(empty)';
+        unmappedCountries.set(key, (unmappedCountries.get(key) ?? 0) + 1);
+        continue;
+      }
+      profileId = mapping.profileId;
+      profileLabel = mapping.profileLabel;
+      region = mapping.region;
+    } else {
+      profileId = args.profileId!;
+      profileLabel = args.profileLabel;
+      region = args.region;
+    }
+
     prepared.push({
       metric_date: date,
+      profile_id: profileId,
+      profile_label: profileLabel,
+      region,
       campaign_name: campaignName,
       campaign_id:      lookup('campaign_id') || null,
       campaign_status:  lookup('campaign_status') || null,
@@ -343,6 +458,15 @@ async function main(): Promise<void> {
       units:       parseInteger(lookup('units')),
       raw_csv: rawCsv,
     });
+  }
+
+  if (unmappedCountries.size > 0) {
+    console.warn(`[warn] Skipped rows for countries not in --country-map:`);
+    for (const [c, count] of [...unmappedCountries.entries()].sort((a, b) => b[1] - a[1])) {
+      console.warn(`    "${c}" — ${count} row(s)`);
+    }
+    console.warn(`  Add these countries to --country-map if you want them imported.`);
+    console.log('');
   }
 
   console.log(`Parsed ${prepared.length} valid row(s) out of ${rows.length}; ${errors.length} skipped.`);
@@ -413,7 +537,7 @@ async function main(): Promise<void> {
             source_file      = EXCLUDED.source_file,
             imported_at      = NOW()`,
         [
-          p.metric_date, args.profileId, args.profileLabel, args.region, args.adProduct,
+          p.metric_date, p.profile_id, p.profile_label, p.region, args.adProduct,
           p.portfolio_name, p.campaign_id, p.campaign_name, p.campaign_status,
           p.targeting_type, p.bidding_strategy, p.currency_code,
           p.impressions, p.clicks, p.spend, p.orders, p.sales, p.units,
