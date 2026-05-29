@@ -18,8 +18,12 @@
 // ============================================================================
 
 import { Client as PgClient } from 'pg';
+// stream-json v3 — lowercase paths; .asStream() variants are Node Duplexes.
+import parserStream from 'stream-json';
+import pick from 'stream-json/filters/pick.js';
+import streamArray from 'stream-json/streamers/stream-array.js';
 import { SpApiClient } from './client.js';
-import { runReport } from './reports.js';
+import { streamReport } from './reports.js';
 import { getPgClient } from '../supabase.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -83,13 +87,23 @@ export interface IngestSqpPeriodOptions {
 }
 
 /**
- * Pull one period's SQP report for one marketplace, land the raw payload,
+ * Pull one period's SQP report for one marketplace, stream-parse it, and
  * upsert per-(ASIN, query) rows into brain.search_query_performance.
+ *
+ * Streaming because Amazon's SQP response can run to hundreds of MB of JSON
+ * for an active brand at MONTH grain — RW's first 1-month test crashed at
+ * 8GB heap with the original buffer-everything approach. We pipe the gzipped
+ * stream → gunzip → stream-json → row-by-row upsert, so peak memory is
+ * bounded by the upsert batch size, not by the report size.
+ *
+ * raw.sp_api_report carries metadata only (no payload). The full document
+ * is re-fetchable via the reportDocumentId if needed for replay; storing a
+ * gigabyte JSONB per period isn't worth the cost.
  */
 export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
   rowsUpserted: number;
 }> {
-  const result = await runReport(opts.spClient, {
+  const { meta, stream } = await streamReport(opts.spClient, {
     reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
     marketplaceIds: [opts.marketplaceId],
     dataStartTime: opts.periodStart,
@@ -99,63 +113,81 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
     },
   });
 
-  const parsed = JSON.parse(result.rawText) as SqpReportResponse;
-  const rows = parsed.dataByAsin ?? [];
-
-  // 1. Land raw payload (for replay + audit)
+  // 1. Land metadata in raw.sp_api_report — empty payload, since the real
+  //    document is too big to JSONB.
   const rawInsert = await opts.pg.query<{ raw_id: number }>(
     `INSERT INTO raw.sp_api_report
       (connection_id, sync_run_id, report_type, report_id, document_id, marketplace_ids,
        data_start_time, data_end_time, processing_status, payload, payload_bytes, fetched_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb, 0, NOW())
      ON CONFLICT (report_type, report_id) DO UPDATE
-       SET payload = EXCLUDED.payload, processing_status = EXCLUDED.processing_status,
-           parsed_at = NULL
+       SET processing_status = EXCLUDED.processing_status, parsed_at = NULL
      RETURNING raw_id`,
     [
       opts.connectionId,
       opts.syncRunId,
       'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
-      result.meta.reportId,
-      result.meta.reportDocumentId ?? null,
+      meta.reportId,
+      meta.reportDocumentId ?? null,
       [opts.marketplaceId],
       opts.periodStart.toISOString(),
       opts.periodEnd.toISOString(),
-      result.meta.processingStatus,
-      JSON.stringify(parsed),
-      Buffer.byteLength(result.rawText, 'utf8'),
+      meta.processingStatus,
     ],
   );
   const rawId = rawInsert.rows[0]!.raw_id;
 
-  // 2. Upsert each (ASIN, search_query) row.
+  // 2. Stream-parse the JSON and upsert in batches of 500.
+  //
+  // stream-json's Pick + StreamArray yields one element of `dataByAsin`
+  // at a time as `{ key, value }`. We accumulate up to BATCH_SIZE rows
+  // and flush via a single multi-VALUES UPSERT.
+  const BATCH_SIZE = 500;
+  type Row = {
+    periodType: SqpPeriodType;
+    startStr: string;
+    endStr: string;
+    asin: string;
+    query: string;
+    score: number | null;
+    volume: number | null;
+    impressions: number | null;
+    clicks: number | null;
+    cartAdds: number | null;
+    purchases: number | null;
+    impressionShare: number | null;
+    clickShare: number | null;
+    cartAddShare: number | null;
+    purchaseShare: number | null;
+    rawId: number;
+  };
+  const batch: Row[] = [];
   let rowsUpserted = 0;
-  for (const r of rows) {
-    const asin = r.asin;
-    const sqd = r.searchQueryData ?? {};
-    const query = sqd.searchQuery;
-    if (!asin || !query) continue;  // can't key the row
 
-    // Period boundaries: prefer the row's own startDate/endDate if present
-    // (Amazon's response includes them for some report shapes); fall back to
-    // the call's window. Always store as DATE.
-    const startStr = r.startDate ?? opts.periodStart.toISOString().slice(0, 10);
-    const endStr = r.endDate ?? opts.periodEnd.toISOString().slice(0, 10);
-
+  const flush = async (): Promise<void> => {
+    if (batch.length === 0) return;
+    const params: unknown[] = [];
+    const valuesClauses: string[] = [];
+    for (const r of batch) {
+      const i = params.length;
+      params.push(
+        r.periodType, r.startStr, r.endStr, r.asin, r.query,
+        r.score, r.volume,
+        r.impressions, r.clicks, r.cartAdds, r.purchases,
+        r.impressionShare, r.clickShare, r.cartAddShare, r.purchaseShare,
+        r.rawId,
+      );
+      const placeholders = Array.from({ length: 16 }, (_, k) => `$${i + k + 1}`);
+      valuesClauses.push(`(${placeholders.join(',')}, NOW())`);
+    }
     await opts.pg.query(
       `INSERT INTO brain.search_query_performance (
-        period_type, period_start, period_end, asin, search_query,
-        search_query_score, search_query_volume,
-        impressions, clicks, cart_adds, purchases,
-        impression_share, click_share, cart_add_share, purchase_share,
-        raw_id, ingested_at
-       ) VALUES (
-        $1, $2, $3, $4, $5,
-        $6, $7,
-        $8, $9, $10, $11,
-        $12, $13, $14, $15,
-        $16, NOW()
-       )
+          period_type, period_start, period_end, asin, search_query,
+          search_query_score, search_query_volume,
+          impressions, clicks, cart_adds, purchases,
+          impression_share, click_share, cart_add_share, purchase_share,
+          raw_id, ingested_at
+       ) VALUES ${valuesClauses.join(',')}
        ON CONFLICT (period_type, period_start, asin, search_query) DO UPDATE SET
          period_end           = EXCLUDED.period_end,
          search_query_score   = EXCLUDED.search_query_score,
@@ -170,23 +202,50 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
          purchase_share       = EXCLUDED.purchase_share,
          raw_id               = EXCLUDED.raw_id,
          ingested_at          = NOW()`,
-      [
-        opts.periodType, startStr, endStr, asin, query,
-        sqd.searchQueryScore ?? null,
-        sqd.searchQueryVolume ?? null,
-        r.impressionData?.totalQueryImpressionCount ?? null,
-        r.clickData?.totalClickCount ?? null,
-        r.cartAddData?.totalCartAddCount ?? null,
-        r.purchaseData?.totalPurchaseCount ?? null,
-        r.impressionData?.asinImpressionShare ?? null,
-        r.clickData?.asinClickShare ?? null,
-        r.cartAddData?.asinCartAddShare ?? null,
-        r.purchaseData?.asinPurchaseShare ?? null,
-        rawId,
-      ],
+      params,
     );
-    rowsUpserted++;
+    rowsUpserted += batch.length;
+    batch.length = 0;
+  };
+
+  // Build the streaming pipeline:
+  //   gunzipped JSON bytes → tokens → pick `dataByAsin` → array elements
+  const pipeline = stream
+    .pipe(parserStream())
+    .pipe(pick.asStream({ filter: 'dataByAsin' }))
+    .pipe(streamArray.asStream());
+
+  for await (const chunk of pipeline as AsyncIterable<{ value: SearchQueryAsinRow }>) {
+    const r = chunk.value;
+    const asin = r.asin;
+    const sqd = r.searchQueryData ?? {};
+    const query = sqd.searchQuery;
+    if (!asin || !query) continue;
+
+    // Period boundaries: prefer the row's own startDate/endDate if present;
+    // fall back to the call's window. Always YYYY-MM-DD.
+    const startStr = r.startDate ?? opts.periodStart.toISOString().slice(0, 10);
+    const endStr = r.endDate ?? opts.periodEnd.toISOString().slice(0, 10);
+
+    batch.push({
+      periodType: opts.periodType,
+      startStr, endStr, asin, query,
+      score:           sqd.searchQueryScore ?? null,
+      volume:          sqd.searchQueryVolume ?? null,
+      impressions:     r.impressionData?.totalQueryImpressionCount ?? null,
+      clicks:          r.clickData?.totalClickCount ?? null,
+      cartAdds:        r.cartAddData?.totalCartAddCount ?? null,
+      purchases:       r.purchaseData?.totalPurchaseCount ?? null,
+      impressionShare: r.impressionData?.asinImpressionShare ?? null,
+      clickShare:      r.clickData?.asinClickShare ?? null,
+      cartAddShare:    r.cartAddData?.asinCartAddShare ?? null,
+      purchaseShare:   r.purchaseData?.asinPurchaseShare ?? null,
+      rawId,
+    });
+
+    if (batch.length >= BATCH_SIZE) await flush();
   }
+  await flush();
 
   await opts.pg.query(
     'UPDATE raw.sp_api_report SET parsed_at = NOW() WHERE raw_id = $1',
