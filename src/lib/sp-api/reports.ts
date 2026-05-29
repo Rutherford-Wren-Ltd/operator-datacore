@@ -1,5 +1,6 @@
-import { gunzipSync } from 'node:zlib';
+import { gunzipSync, createGunzip } from 'node:zlib';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { Readable } from 'node:stream';
 import { SpApiClient } from './client.js';
 
 interface CreateReportResp {
@@ -96,6 +97,81 @@ export async function runReport(client: SpApiClient, opts: RunReportOpts): Promi
     doc.payload.compressionAlgorithm === 'GZIP' ? gunzipSync(buf).toString('utf8') : buf.toString('utf8');
 
   return { meta: meta!, rawText };
+}
+
+/**
+ * Streaming variant of runReport — same createReport + poll + getDocument
+ * dance, but returns a Node Readable that yields the (decompressed) report
+ * body as bytes flow in, instead of buffering everything into a single
+ * string in memory.
+ *
+ * Use this for reports whose response is large enough that buffering causes
+ * OOM (e.g. Brand Analytics Search Query Performance — RW's first 1-month
+ * test hit >8GB heap with the buffered runReport before the JSON could
+ * even be parsed). Caller is responsible for streaming-parse on top of the
+ * returned stream — typically via `stream-json`.
+ *
+ * Returned `stream` is a Node Readable; you can `.pipe()` it through more
+ * Transforms or consume it via async iteration.
+ */
+export async function streamReport(client: SpApiClient, opts: RunReportOpts): Promise<{
+  meta: GetReportResp;
+  stream: NodeJS.ReadableStream;
+}> {
+  const create = await client.request<CreateReportResp>({
+    method: 'POST',
+    path: '/reports/2021-06-30/reports',
+    body: {
+      reportType: opts.reportType,
+      marketplaceIds: opts.marketplaceIds,
+      dataStartTime: opts.dataStartTime?.toISOString(),
+      dataEndTime: opts.dataEndTime?.toISOString(),
+      reportOptions: opts.reportOptions,
+    },
+  });
+
+  const reportId = create.payload.reportId;
+  let meta: GetReportResp;
+  let waitMs = 5_000;
+  const maxWaitMs = 60_000;
+
+  for (let i = 0; i < 60; i++) {
+    const got = await client.request<GetReportResp>({
+      method: 'GET',
+      path: `/reports/2021-06-30/reports/${reportId}`,
+    });
+    meta = got.payload;
+    if (meta.processingStatus === 'DONE') break;
+    if (meta.processingStatus === 'CANCELLED' || meta.processingStatus === 'FATAL') {
+      throw new Error(`Report ${reportId} ended with status ${meta.processingStatus}`);
+    }
+    await sleep(Math.min(waitMs, maxWaitMs));
+    waitMs = Math.min(waitMs * 1.5, maxWaitMs);
+  }
+
+  if (meta!.processingStatus !== 'DONE' || !meta!.reportDocumentId) {
+    throw new Error(`Report ${reportId} did not complete in time. Status: ${meta!.processingStatus}`);
+  }
+
+  const doc = await client.request<GetReportDocumentResp>({
+    method: 'GET',
+    path: `/reports/2021-06-30/documents/${meta!.reportDocumentId}`,
+  });
+
+  const fetched = await fetch(doc.payload.url);
+  if (!fetched.ok) {
+    throw new Error(`Report document fetch failed (${fetched.status}): ${await fetched.text()}`);
+  }
+  if (!fetched.body) {
+    throw new Error(`Report document fetch returned no body (${doc.payload.reportDocumentId})`);
+  }
+
+  // WHATWG ReadableStream → Node Readable, then gunzip if needed.
+  const nodeStream = Readable.fromWeb(fetched.body as unknown as Parameters<typeof Readable.fromWeb>[0]);
+  const stream: NodeJS.ReadableStream =
+    doc.payload.compressionAlgorithm === 'GZIP' ? nodeStream.pipe(createGunzip()) : nodeStream;
+
+  return { meta: meta!, stream };
 }
 
 /**
