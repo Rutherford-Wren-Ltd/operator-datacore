@@ -27,7 +27,7 @@
 
 import { parseArgs } from 'node:util';
 import { createWriteStream, statSync, readFileSync } from 'node:fs';
-import { createGunzip } from 'node:zlib';
+import { createGunzip, gunzipSync } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
@@ -176,9 +176,22 @@ async function main(): Promise<void> {
           });
           console.log('');
           console.log(`Error document available at: ${doc.payload.url}`);
+          console.log(`  compression: ${doc.payload.compressionAlgorithm ?? 'none'}`);
           const resp = await fetch(doc.payload.url);
           if (resp.ok) {
-            const text = await resp.text();
+            // Amazon's error documents are gzipped just like normal report
+            // documents. Fetch as ArrayBuffer + decompress if the doc
+            // payload declares GZIP; fall back to autodetect on the gzip
+            // magic bytes (1F 8B) if no algorithm reported.
+            const buf = Buffer.from(await resp.arrayBuffer());
+            const isGzip = doc.payload.compressionAlgorithm === 'GZIP'
+              || (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b);
+            let text: string;
+            try {
+              text = isGzip ? gunzipSync(buf).toString('utf8') : buf.toString('utf8');
+            } catch {
+              text = `(gunzip failed, raw bytes: ${buf.slice(0, 200).toString('hex')}...)`;
+            }
             console.log('Error document body:');
             console.log(text.slice(0, 4096));
           }
