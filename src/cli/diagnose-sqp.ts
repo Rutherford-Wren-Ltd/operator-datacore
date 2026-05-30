@@ -58,12 +58,23 @@ function monthBoundary(d: Date): { start: Date; end: Date } {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
+function weekBoundary(d: Date): { start: Date; end: Date } {
+  // Brand Analytics weeks: Sunday → Saturday.
+  const day = d.getUTCDay(); // 0=Sun
+  const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - day));
+  const end = new Date(start.getTime() + 6 * 86_400_000 + (86_400_000 - 1));
+  return { start, end };
+}
+
 async function main(): Promise<void> {
   const { values } = parseArgs({
     options: {
-      region:       { type: 'string' },
-      marketplaces: { type: 'string' },
+      region:        { type: 'string' },
+      marketplaces:  { type: 'string' },
       'period-type': { type: 'string' },
+      month:         { type: 'string' },   // YYYY-MM, e.g. 2026-03
+      week:          { type: 'string' },   // YYYY-MM-DD (any day in the desired Sun-Sat week)
+      'months-back': { type: 'string' },   // shorthand: months back from current
     },
   });
 
@@ -75,15 +86,43 @@ async function main(): Promise<void> {
     ? (MARKETPLACE_ALIASES[values.marketplaces.toUpperCase()] ?? values.marketplaces)
     : (regionConfig.marketplaceIds[0] ?? 'A1F83G8C2ARO7P');
 
-  // Default to the last completed month.
+  const periodType = (values['period-type'] ?? 'MONTH').toUpperCase();
+  if (periodType !== 'MONTH' && periodType !== 'WEEK') {
+    throw new Error(`--period-type must be MONTH or WEEK. Got "${values['period-type']}".`);
+  }
+
+  // Resolve target period.
+  let period: { start: Date; end: Date };
   const now = new Date();
-  const prevMonthDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15));
-  const period = monthBoundary(prevMonthDay);
+  if (values.month) {
+    if (!/^\d{4}-\d{2}$/.test(values.month)) {
+      throw new Error(`--month must be YYYY-MM. Got "${values.month}".`);
+    }
+    const [y, m] = values.month.split('-').map(Number);
+    period = monthBoundary(new Date(Date.UTC(y!, m! - 1, 15)));
+  } else if (values.week) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(values.week)) {
+      throw new Error(`--week must be YYYY-MM-DD. Got "${values.week}".`);
+    }
+    period = weekBoundary(new Date(values.week + 'T00:00:00Z'));
+  } else {
+    // Default for MONTH: N months back (default 1 = last completed month).
+    // Default for WEEK: 1 week back (last completed Sun-Sat week).
+    const monthsBack = values['months-back'] ? parseInt(values['months-back'], 10) : 1;
+    if (periodType === 'MONTH') {
+      const ref = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - monthsBack, 15));
+      period = monthBoundary(ref);
+    } else {
+      const ref = new Date(now.getTime() - 7 * 86_400_000);
+      period = weekBoundary(ref);
+    }
+  }
 
   console.log('SQP diagnostic — single-period fetch + sample dump');
   console.log('---------------------------------------------------');
   console.log(`  Region:        ${region}`);
   console.log(`  Marketplace:   ${marketplaceId}`);
+  console.log(`  Period type:   ${periodType}`);
   console.log(`  Period:        ${period.start.toISOString().slice(0, 10)} → ${period.end.toISOString().slice(0, 10)}`);
   console.log('');
 
@@ -104,7 +143,7 @@ async function main(): Promise<void> {
       marketplaceIds: [marketplaceId],
       dataStartTime: period.start.toISOString(),
       dataEndTime: period.end.toISOString(),
-      reportOptions: { reportPeriod: 'MONTH' },
+      reportOptions: { reportPeriod: periodType },
     },
   });
   const reportId = create.payload.reportId;
@@ -123,6 +162,30 @@ async function main(): Promise<void> {
     process.stdout.write(`   [attempt ${i + 1}] status=${meta.processingStatus}\n`);
     if (meta.processingStatus === 'DONE') break;
     if (meta.processingStatus === 'CANCELLED' || meta.processingStatus === 'FATAL') {
+      console.log('');
+      console.log(`Report ended with status ${meta.processingStatus}. Full response payload:`);
+      console.log(JSON.stringify(meta, null, 2));
+      // For FATAL, Amazon often attaches a small error document. Try to
+      // fetch it the same way as a normal report document — if it 200s, the
+      // body is a JSON error.
+      if (meta.reportDocumentId) {
+        try {
+          const doc = await client.request<GetReportDocumentResp>({
+            method: 'GET',
+            path: `/reports/2021-06-30/documents/${meta.reportDocumentId}`,
+          });
+          console.log('');
+          console.log(`Error document available at: ${doc.payload.url}`);
+          const resp = await fetch(doc.payload.url);
+          if (resp.ok) {
+            const text = await resp.text();
+            console.log('Error document body:');
+            console.log(text.slice(0, 4096));
+          }
+        } catch (e) {
+          console.log(`(failed to fetch error document: ${(e as Error).message})`);
+        }
+      }
       throw new Error(`Report ended with status ${meta.processingStatus}`);
     }
     await sleep(Math.min(waitMs, 60_000));
