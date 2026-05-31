@@ -19,6 +19,10 @@ dist/
 supabase/.branches/
 supabase/.temp/
 
+# Diagnostic output
+sqp-diagnostic-*
+*.bak-*
+
 # Generated
 *.tsbuildinfo
 coverage/

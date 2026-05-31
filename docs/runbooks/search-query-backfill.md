@@ -8,6 +8,11 @@ Access requirements: Brand Registry enrolment + the SP-API `Brand
 Analytics` role. RW has both (already pulling Sales & Traffic, which uses
 the same role).
 
+**One call = one (period, marketplace, ASIN).** Amazon's API now requires
+the `asin` reportOption (confirmed 2026-05-30). The CLI fans out across
+your ASIN set; expect ~3,400 calls for a 17-month UK backfill of 200
+ASINs, ~57 hours wall-clock at the 60s pacing floor.
+
 ## Quick sanity check (1 month, 1 marketplace, ~2 min)
 
 Verify auth + parser before kicking off a long backfill. Pulls the most

@@ -11,24 +11,26 @@
 // Usage:
 //   npm run backfill-search-query -- --period-type MONTH --months 17
 //   npm run backfill-search-query -- --period-type WEEK --weeks 26
-//   npm run backfill-search-query -- --period-type QUARTER --quarters 8
 //   npm run backfill-search-query -- --period-type MONTH --from 2025-01-01 --to 2026-04-30 --skip-existing
-//   npm run backfill-search-query -- --period-type MONTH --months 17 --region eu --marketplaces UK
+//   npm run backfill-search-query -- --period-type MONTH --months 1 --asins B0CX9FCC59
+//   npm run backfill-search-query -- --period-type MONTH --months 12 --top-n 50
+//   npm run backfill-search-query -- --period-type MONTH --months 17 --brands Wrenbury,Hemswell
+//
+// ASIN scope (Amazon now requires `asin` per call — confirmed 2026-05-30):
+//   --asins B0X,B0Y,...   explicit list (overrides everything below)
+//   --top-n N             top N by 30-day units from brain.sales_traffic_daily
+//   --brands B1,B2        all active sku_master rows with matching brand
+//   (none of the above)   all active sku_master ASINs (default)
 //
 // Period boundaries are auto-aligned: --from / --to are widened outward to
 // the nearest period boundary (WEEK = Sun-Sat, MONTH = calendar, QUARTER =
 // calendar Q1-Q4) before requesting from Amazon.
 //
 // SP-API rate limits: documented 1 req / 45s for SQP createReport. The
-// library floor is 60s to leave headroom. --delay can raise it further;
-// it cannot go below.
+// library floor is 60s to leave headroom.
 //
-// Granularity choice:
-//   - WEEK   : Sunday-Saturday weeks. 26-week (6mo) backfill is a good
-//              starting window for trailing trend analysis.
-//   - MONTH  : Calendar months. 17 months is the documented Amazon ceiling
-//              for monthly reports — use this for YoY.
-//   - QUARTER: Calendar quarters. Useful for high-level rollups.
+// Total call count = periods × marketplaces × ASINs. A 17-month UK backfill
+// across 200 ASINs is ~3,400 calls × 60s ≈ 57 hours wall-clock.
 // ============================================================================
 
 import { parseArgs } from 'node:util';
@@ -70,6 +72,9 @@ interface ParsedArgs {
   count: number | null;        // --weeks / --months / --quarters
   region: SpApiRegion | null;
   marketplaceFilter: string[] | null;
+  asinsFilter: string[] | null;     // explicit --asins B0X,B0Y,...
+  brandsFilter: string[] | null;    // --brands Wrenbury,Hemswell — picks active ASINs from sku_master
+  topN: number | null;              // --top-n 50 — picks top N ASINs by recent units sold from sales_traffic
   delayMs: number;
   skipExisting: boolean;
   dryRun: boolean;
@@ -86,6 +91,9 @@ function parseCliArgs(): ParsedArgs {
       quarters:      { type: 'string' },
       region:        { type: 'string' },
       marketplaces:  { type: 'string' },
+      asins:         { type: 'string' },                       // explicit list
+      brands:        { type: 'string' },                       // pick from sku_master by brand(s)
+      'top-n':       { type: 'string' },                       // pick top-N by 30d units
       delay:         { type: 'string', default: '60000' },
       'skip-existing': { type: 'boolean', default: false },
       'dry-run':     { type: 'boolean', default: false },
@@ -125,6 +133,17 @@ function parseCliArgs(): ParsedArgs {
     region = values.region;
   }
 
+  const asinsFilter = values.asins
+    ? values.asins.split(',').map((s) => s.trim()).filter(Boolean)
+    : null;
+  const brandsFilter = values.brands
+    ? values.brands.split(',').map((s) => s.trim()).filter(Boolean)
+    : null;
+  const topN = values['top-n'] ? parseInt(values['top-n'], 10) : null;
+  if (topN !== null && (!Number.isFinite(topN) || topN < 1)) {
+    throw new Error(`--top-n must be a positive integer.`);
+  }
+
   return {
     periodType,
     from,
@@ -132,43 +151,94 @@ function parseCliArgs(): ParsedArgs {
     count,
     region,
     marketplaceFilter: resolveMarketplaceFilter(values.marketplaces),
+    asinsFilter,
+    brandsFilter,
+    topN,
     delayMs: parseInt(values.delay!, 10),
     skipExisting: values['skip-existing'] ?? false,
     dryRun: values['dry-run'] ?? false,
   };
 }
 
+/**
+ * Resolve the list of ASINs to backfill. Three sources, in precedence order:
+ *
+ *   1. --asins B0X,B0Y,...      (explicit list)
+ *   2. --top-n N                 (top-N by 30-day units from brain.sales_traffic_daily, per marketplace)
+ *   3. --brands Wrenbury,...    (active ASINs from brain.sku_master with matching brand)
+ *
+ * If none of the above is set, default to all active ASINs in sku_master.
+ */
+async function resolveAsins(
+  pg: import('pg').Client,
+  args: ParsedArgs,
+  marketplaceIds: string[],
+): Promise<string[]> {
+  if (args.asinsFilter) return args.asinsFilter;
+
+  if (args.topN !== null) {
+    const { rows } = await pg.query<{ asin: string }>(
+      `SELECT child_asin AS asin
+         FROM brain.sales_traffic_daily
+        WHERE marketplace_id = ANY($1)
+          AND metric_date >= CURRENT_DATE - INTERVAL '30 days'
+          AND metric_date <  CURRENT_DATE
+          AND child_asin IS NOT NULL
+        GROUP BY child_asin
+        ORDER BY SUM(units_ordered) DESC NULLS LAST
+        LIMIT $2`,
+      [marketplaceIds, args.topN],
+    );
+    return rows.map((r) => r.asin);
+  }
+
+  // Default + --brands path: from sku_master where status is reorderable.
+  const brandsClause = args.brandsFilter
+    ? `AND brand = ANY($1)`
+    : ``;
+  const params = args.brandsFilter ? [args.brandsFilter] : [];
+  const { rows } = await pg.query<{ asin: string }>(
+    `SELECT DISTINCT asin
+       FROM brain.sku_master
+      WHERE status IN ('active', 'seasonal', 'new_launch')
+        AND asin IS NOT NULL
+        ${brandsClause}`,
+    params,
+  );
+  return rows.map((r) => r.asin);
+}
+
 async function loadExistingKeys(
   pg: import('pg').Client,
   periodType: SqpPeriodType,
   marketplaceIds: string[],
+  asins: string[],
   fromDate: Date,
   toDate: Date,
 ): Promise<Set<string>> {
-  // raw.sp_api_report is where we record one row per Amazon report request.
-  // brain.search_query_performance is per (period × asin × query); a period
-  // counts as "done" if any rows exist for it in the period bucket. The raw
-  // table also covers periods that returned zero rows (a brand with no
-  // queries that week — rare but possible).
-  //
-  // Use raw.sp_api_report keyed by report_type + marketplace + data window.
-  // Cast timestamps to text (YYYY-MM-DD) to avoid the node-pg DATE/timezone
-  // shift that bit sales-traffic in #48.
-  const { rows } = await pg.query<{ marketplace_id: string; period_start: string }>(
-    `SELECT DISTINCT
-            (marketplace_ids[1])                          AS marketplace_id,
-            to_char(data_start_time AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS period_start
-       FROM raw.sp_api_report
-      WHERE report_type = 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT'
-        AND processing_status = 'DONE'
-        AND (marketplace_ids[1]) = ANY($1)
-        AND data_start_time >= $2::timestamptz
-        AND data_start_time <= $3::timestamptz`,
-    [marketplaceIds, fromDate.toISOString(), toDate.toISOString()],
+  // Query brain.search_query_performance directly — it has marketplace_id +
+  // asin in the PK after migration 0023. A (period, marketplace, asin)
+  // counts as "done" if any rows exist for it. to_char on the date column
+  // dodges the node-pg DATE/timezone shift fix from #48.
+  const { rows } = await pg.query<{ marketplace_id: string; asin: string; period_start: string }>(
+    `SELECT DISTINCT marketplace_id, asin,
+            to_char(period_start, 'YYYY-MM-DD') AS period_start
+       FROM brain.search_query_performance
+      WHERE period_type = $1
+        AND marketplace_id = ANY($2)
+        AND asin = ANY($3)
+        AND period_start BETWEEN $4 AND $5`,
+    [
+      periodType,
+      marketplaceIds,
+      asins,
+      fromDate.toISOString().slice(0, 10),
+      toDate.toISOString().slice(0, 10),
+    ],
   );
   const keys = new Set<string>();
   for (const r of rows) {
-    keys.add(`${periodType}|${r.period_start}|${r.marketplace_id}`);
+    keys.add(`${periodType}|${r.period_start}|${r.marketplace_id}|${r.asin}`);
   }
   return keys;
 }
@@ -238,12 +308,6 @@ async function main(): Promise<void> {
   console.log(`  Delay:         ${args.delayMs}ms (floor 60000ms)`);
   console.log(`  Skip existing: ${args.skipExisting}`);
   console.log(`  Dry run:       ${args.dryRun}`);
-  console.log('');
-
-  if (args.dryRun) {
-    console.log('--dry-run set — would request the periods listed above. No API calls fired.');
-    return;
-  }
 
   const spClient = new SpApiClient({
     region: regionConfig.region,
@@ -252,6 +316,37 @@ async function main(): Promise<void> {
     refreshToken: regionConfig.refreshToken,
   });
   let pg = await getPgClient();
+
+  // Resolve the ASIN set (requires pg for sku_master / sales_traffic lookups).
+  const asins = await resolveAsins(pg, args, marketplaceIds);
+  if (asins.length === 0) {
+    throw new Error(
+      'No ASINs resolved. Specify --asins, --brands, --top-n, or ensure brain.sku_master has active rows.',
+    );
+  }
+  console.log(`  ASIN count:    ${asins.length}` + (
+    args.asinsFilter ? ' (--asins explicit list)' :
+    args.topN !== null ? ` (--top-n ${args.topN} by 30d units)` :
+    args.brandsFilter ? ` (--brands ${args.brandsFilter.join('/')})` :
+    ' (all active in brain.sku_master)'
+  ));
+  if (asins.length <= 20) {
+    console.log(`    asins:       ${asins.join(', ')}`);
+  } else {
+    console.log(`    first 5:     ${asins.slice(0, 5).join(', ')}, ...`);
+    console.log(`    last 5:      ${asins.slice(-5).join(', ')}`);
+  }
+  const totalTasks = periods.length * marketplaceIds.length * asins.length;
+  const estDuration = (totalTasks * args.delayMs / 1000 / 60 / 60).toFixed(1);
+  console.log(`  Total calls:   ${totalTasks.toLocaleString()} (= ${periods.length} periods × ${marketplaceIds.length} markets × ${asins.length} ASINs)`);
+  console.log(`  Est. duration: ~${estDuration} hours wall-clock at ${args.delayMs}ms/call`);
+  console.log('');
+
+  if (args.dryRun) {
+    console.log('--dry-run set — would request the calls outlined above. No API calls fired.');
+    try { await pg.end(); } catch { /* */ }
+    return;
+  }
 
   try {
     const { rows: connRows } = await pg.query<{ connection_id: string }>(
@@ -276,8 +371,8 @@ async function main(): Promise<void> {
 
     let existingKeys: Set<string> | undefined;
     if (args.skipExisting) {
-      existingKeys = await loadExistingKeys(pg, args.periodType, marketplaceIds, fromDate, toDate);
-      console.log(`  Skip set:      ${existingKeys.size} period(s) already present`);
+      existingKeys = await loadExistingKeys(pg, args.periodType, marketplaceIds, asins, fromDate, toDate);
+      console.log(`  Skip set:      ${existingKeys.size} (period, marketplace, ASIN) tuple(s) already present`);
       console.log('');
     }
 
@@ -288,6 +383,7 @@ async function main(): Promise<void> {
       connectionId,
       syncRunId,
       marketplaceIds,
+      asins,
       periodType: args.periodType,
       fromDate,
       toDate,
@@ -295,7 +391,7 @@ async function main(): Promise<void> {
       ...(existingKeys ? { existingKeys } : {}),
       onProgress: (info) => {
         const pct = ((info.done / info.total) * 100).toFixed(1).padStart(5);
-        console.log(`  [${pct}%] ${info.periodStart} → ${info.periodEnd} ${info.marketplace.padEnd(15)} → ${info.rows} rows`);
+        console.log(`  [${pct}%] ${info.periodStart} → ${info.periodEnd} ${info.marketplace.padEnd(15)} ${info.asin} → ${info.rows} rows`);
       },
     });
 
@@ -314,7 +410,7 @@ async function main(): Promise<void> {
     console.log('');
     console.log(
       `Done in ${durationMin} min. ${result.tasksRun} call(s) made, ${result.tasksSkipped} skipped, ` +
-      `${result.totalRows} rows upserted across ${marketplaceIds.length} marketplace(s) and ${result.periodCount} period(s).`,
+      `${result.totalRows} rows upserted across ${marketplaceIds.length} marketplace(s), ${result.periodCount} period(s), ${result.asinCount} ASIN(s).`,
     );
   } finally {
     try { await pg.end(); } catch { /* may already be ended by recent eviction */ }
