@@ -33,9 +33,12 @@
 // ============================================================================
 
 import { Client as PgClient } from 'pg';
-import { readFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { createReadStream, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import parserStream from 'stream-json';
+import pick from 'stream-json/filters/pick.js';
+import streamArray from 'stream-json/streamers/stream-array.js';
 import { SpApiClient } from './client.js';
 import { downloadReportToFile } from './reports.js';
 import { getPgClient } from '../supabase.js';
@@ -138,17 +141,9 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
     meta = downloadResult.meta;
     bytesWritten = downloadResult.bytesWritten;
 
-    // Parse from disk. readFileSync is fine for hundreds-of-MB files;
-    // it's the redundant in-memory copies in the old runReport path
-    // that were the problem.
-    const rawText = readFileSync(tmpPath, 'utf8');
-    const parsed = JSON.parse(rawText) as SqpReportResponse;
-    const rows = parsed.dataByAsin ?? [];
-
     // 1. Land metadata in raw.sp_api_report — payload as an empty stub
-    //    since the real document is on disk for the duration of this call,
-    //    and could be huge. The reportDocumentId is preserved so the
-    //    original is re-fetchable via Amazon if needed.
+    //    since the real document is on disk and could be hundreds of MB.
+    //    reportDocumentId is preserved so the original is re-fetchable.
     const rawInsert = await opts.pg.query<{ raw_id: number }>(
       `INSERT INTO raw.sp_api_report
         (connection_id, sync_run_id, report_type, report_id, document_id, marketplace_ids,
@@ -172,106 +167,111 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
     );
     const rawId = rawInsert.rows[0]!.raw_id;
 
-    return await ingestParsedRows(opts, parsed, rows, rawId);
+    // 2. Stream-parse from disk, batch upsert. Never holds the full JSON
+    //    object tree in memory.
+    //
+    //    File source is well-behaved for stream-json's backpressure (the
+    //    same pattern failed in #56 with a fetch-stream source, but the
+    //    fix in #62 separated download from parse — both are now
+    //    individually well-behaved).
+    const BATCH_SIZE = 500;
+    let rowsUpserted = 0;
+    type Row = {
+      startStr: string; endStr: string; asin: string; query: string;
+      score: number | null; volume: number | null;
+      impressions: number | null; clicks: number | null;
+      cartAdds: number | null; purchases: number | null;
+      impressionShare: number | null; clickShare: number | null;
+      cartAddShare: number | null; purchaseShare: number | null;
+    };
+    const batch: Row[] = [];
+
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) return;
+      const params: unknown[] = [];
+      const valuesClauses: string[] = [];
+      for (const v of batch) {
+        const idx = params.length;
+        params.push(
+          opts.periodType, v.startStr, v.endStr, opts.marketplaceId, v.asin, v.query,
+          v.score, v.volume,
+          v.impressions, v.clicks, v.cartAdds, v.purchases,
+          v.impressionShare, v.clickShare, v.cartAddShare, v.purchaseShare,
+          rawId,
+        );
+        const ph = Array.from({ length: 17 }, (_, k) => `$${idx + k + 1}`);
+        valuesClauses.push(`(${ph.join(',')}, NOW())`);
+      }
+      await opts.pg.query(
+        `INSERT INTO brain.search_query_performance (
+            period_type, period_start, period_end, marketplace_id, asin, search_query,
+            search_query_score, search_query_volume,
+            impressions, clicks, cart_adds, purchases,
+            impression_share, click_share, cart_add_share, purchase_share,
+            raw_id, ingested_at
+         ) VALUES ${valuesClauses.join(',')}
+         ON CONFLICT (period_type, period_start, marketplace_id, asin, search_query) DO UPDATE SET
+           period_end           = EXCLUDED.period_end,
+           search_query_score   = EXCLUDED.search_query_score,
+           search_query_volume  = EXCLUDED.search_query_volume,
+           impressions          = EXCLUDED.impressions,
+           clicks               = EXCLUDED.clicks,
+           cart_adds            = EXCLUDED.cart_adds,
+           purchases            = EXCLUDED.purchases,
+           impression_share     = EXCLUDED.impression_share,
+           click_share          = EXCLUDED.click_share,
+           cart_add_share       = EXCLUDED.cart_add_share,
+           purchase_share       = EXCLUDED.purchase_share,
+           raw_id               = EXCLUDED.raw_id,
+           ingested_at          = NOW()`,
+        params,
+      );
+      rowsUpserted += batch.length;
+      batch.length = 0;
+    };
+
+    const pipeline = createReadStream(tmpPath)
+      .pipe(parserStream())
+      .pipe(pick.asStream({ filter: 'dataByAsin' }))
+      .pipe(streamArray.asStream());
+
+    for await (const chunk of pipeline as AsyncIterable<{ value: SearchQueryAsinRow }>) {
+      const r = chunk.value;
+      const asin = r.asin;
+      const sqd = r.searchQueryData ?? {};
+      const query = sqd.searchQuery;
+      if (!asin || !query) continue;
+
+      batch.push({
+        startStr: r.startDate ?? opts.periodStart.toISOString().slice(0, 10),
+        endStr:   r.endDate   ?? opts.periodEnd.toISOString().slice(0, 10),
+        asin, query,
+        score:           sqd.searchQueryScore ?? null,
+        volume:          sqd.searchQueryVolume ?? null,
+        impressions:     r.impressionData?.totalQueryImpressionCount ?? null,
+        clicks:          r.clickData?.totalClickCount ?? null,
+        cartAdds:        r.cartAddData?.totalCartAddCount ?? null,
+        purchases:       r.purchaseData?.totalPurchaseCount ?? null,
+        impressionShare: pctToFrac(r.impressionData?.asinImpressionShare),
+        clickShare:      pctToFrac(r.clickData?.asinClickShare),
+        cartAddShare:    pctToFrac(r.cartAddData?.asinCartAddShare),
+        purchaseShare:   pctToFrac(r.purchaseData?.asinPurchaseShare),
+      });
+
+      if (batch.length >= BATCH_SIZE) await flush();
+    }
+    await flush();
+
+    await opts.pg.query(
+      'UPDATE raw.sp_api_report SET parsed_at = NOW() WHERE raw_id = $1',
+      [rawId],
+    );
+
+    return { rowsUpserted };
   } finally {
     // Clean up the temp file regardless of outcome.
     try { unlinkSync(tmpPath); } catch { /* doesn't exist */ }
   }
-}
-
-async function ingestParsedRows(
-  opts: IngestSqpPeriodOptions,
-  _parsed: SqpReportResponse,
-  rows: SearchQueryAsinRow[],
-  rawId: number,
-): Promise<{ rowsUpserted: number }> {
-
-  // 2. Batched UPSERT — typical row count per (ASIN, month) is 50-200, so
-  //    one batch covers most cases. Still chunk at 500 to be safe.
-  const BATCH_SIZE = 500;
-  let rowsUpserted = 0;
-  const validRows: Array<{
-    asin: string; query: string; startStr: string; endStr: string;
-    score: number | null; volume: number | null;
-    impressions: number | null; clicks: number | null;
-    cartAdds: number | null; purchases: number | null;
-    impressionShare: number | null; clickShare: number | null;
-    cartAddShare: number | null; purchaseShare: number | null;
-  }> = [];
-
-  for (const r of rows) {
-    const asin = r.asin;
-    const sqd = r.searchQueryData ?? {};
-    const query = sqd.searchQuery;
-    if (!asin || !query) continue;
-
-    validRows.push({
-      asin,
-      query,
-      startStr: r.startDate ?? opts.periodStart.toISOString().slice(0, 10),
-      endStr:   r.endDate   ?? opts.periodEnd.toISOString().slice(0, 10),
-      score:           sqd.searchQueryScore ?? null,
-      volume:          sqd.searchQueryVolume ?? null,
-      impressions:     r.impressionData?.totalQueryImpressionCount ?? null,
-      clicks:          r.clickData?.totalClickCount ?? null,
-      cartAdds:        r.cartAddData?.totalCartAddCount ?? null,
-      purchases:       r.purchaseData?.totalPurchaseCount ?? null,
-      impressionShare: pctToFrac(r.impressionData?.asinImpressionShare),
-      clickShare:      pctToFrac(r.clickData?.asinClickShare),
-      cartAddShare:    pctToFrac(r.cartAddData?.asinCartAddShare),
-      purchaseShare:   pctToFrac(r.purchaseData?.asinPurchaseShare),
-    });
-  }
-
-  for (let i = 0; i < validRows.length; i += BATCH_SIZE) {
-    const batch = validRows.slice(i, i + BATCH_SIZE);
-    const params: unknown[] = [];
-    const valuesClauses: string[] = [];
-    for (const v of batch) {
-      const idx = params.length;
-      params.push(
-        opts.periodType, v.startStr, v.endStr, opts.marketplaceId, v.asin, v.query,
-        v.score, v.volume,
-        v.impressions, v.clicks, v.cartAdds, v.purchases,
-        v.impressionShare, v.clickShare, v.cartAddShare, v.purchaseShare,
-        rawId,
-      );
-      const ph = Array.from({ length: 17 }, (_, k) => `$${idx + k + 1}`);
-      valuesClauses.push(`(${ph.join(',')}, NOW())`);
-    }
-    await opts.pg.query(
-      `INSERT INTO brain.search_query_performance (
-          period_type, period_start, period_end, marketplace_id, asin, search_query,
-          search_query_score, search_query_volume,
-          impressions, clicks, cart_adds, purchases,
-          impression_share, click_share, cart_add_share, purchase_share,
-          raw_id, ingested_at
-       ) VALUES ${valuesClauses.join(',')}
-       ON CONFLICT (period_type, period_start, marketplace_id, asin, search_query) DO UPDATE SET
-         period_end           = EXCLUDED.period_end,
-         search_query_score   = EXCLUDED.search_query_score,
-         search_query_volume  = EXCLUDED.search_query_volume,
-         impressions          = EXCLUDED.impressions,
-         clicks               = EXCLUDED.clicks,
-         cart_adds            = EXCLUDED.cart_adds,
-         purchases            = EXCLUDED.purchases,
-         impression_share     = EXCLUDED.impression_share,
-         click_share          = EXCLUDED.click_share,
-         cart_add_share       = EXCLUDED.cart_add_share,
-         purchase_share       = EXCLUDED.purchase_share,
-         raw_id               = EXCLUDED.raw_id,
-         ingested_at          = NOW()`,
-      params,
-    );
-    rowsUpserted += batch.length;
-  }
-
-  await opts.pg.query(
-    'UPDATE raw.sp_api_report SET parsed_at = NOW() WHERE raw_id = $1',
-    [rawId],
-  );
-
-  return { rowsUpserted };
 }
 
 // ----------------------------------------------------------------------------
