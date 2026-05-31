@@ -33,8 +33,11 @@
 // ============================================================================
 
 import { Client as PgClient } from 'pg';
+import { readFileSync, unlinkSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { SpApiClient } from './client.js';
-import { runReport } from './reports.js';
+import { downloadReportToFile } from './reports.js';
 import { getPgClient } from '../supabase.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -103,52 +106,85 @@ export interface IngestSqpPeriodOptions {
  * Pull one period's SQP report for ONE (marketplace, ASIN), land the raw
  * payload, upsert per-query rows into brain.search_query_performance.
  *
- * Per-ASIN scope means responses are small (~50-500 KB); buffer-parse is
- * fine. The earlier streaming machinery was overkill for this grain.
+ * Download path: createReport + poll + streaming download to a temp file
+ * (decompressed). Reading + JSON.parse from disk avoids holding two copies
+ * of the report body in memory at the same time. SQP responses can be
+ * larger than expected for some periods (~hundreds of MB observed during
+ * the 2026-05-31 1-ASIN test); the on-disk path is robust regardless of
+ * size.
  */
 export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
   rowsUpserted: number;
 }> {
-  const result = await runReport(opts.spClient, {
-    reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
-    marketplaceIds: [opts.marketplaceId],
-    dataStartTime: opts.periodStart,
-    dataEndTime: opts.periodEnd,
-    reportOptions: {
-      reportPeriod: opts.periodType,
-      asin: opts.asin,
-    },
-  });
+  // Choose a temp file path. Use a per-call random suffix to avoid
+  // collisions if two CLI processes happen to overlap.
+  const tmpRoot = join(tmpdir(), 'operator-datacore-sqp');
+  try { mkdirSync(tmpRoot, { recursive: true }); } catch { /* exists */ }
+  const tmpPath = join(tmpRoot, `sqp-${opts.marketplaceId}-${opts.asin}-${opts.periodStart.toISOString().slice(0,10)}-${Date.now()}.json`);
 
-  const parsed = JSON.parse(result.rawText) as SqpReportResponse;
-  const rows = parsed.dataByAsin ?? [];
+  let meta: { reportId: string; reportDocumentId?: string; processingStatus: string };
+  let bytesWritten: number;
+  try {
+    const downloadResult = await downloadReportToFile(opts.spClient, {
+      reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
+      marketplaceIds: [opts.marketplaceId],
+      dataStartTime: opts.periodStart,
+      dataEndTime: opts.periodEnd,
+      reportOptions: {
+        reportPeriod: opts.periodType,
+        asin: opts.asin,
+      },
+    }, tmpPath);
+    meta = downloadResult.meta;
+    bytesWritten = downloadResult.bytesWritten;
 
-  // 1. Land raw payload (full doc — per-ASIN responses are small enough to
-  //    keep for replay / audit).
-  const rawInsert = await opts.pg.query<{ raw_id: number }>(
-    `INSERT INTO raw.sp_api_report
-      (connection_id, sync_run_id, report_type, report_id, document_id, marketplace_ids,
-       data_start_time, data_end_time, processing_status, payload, payload_bytes, fetched_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-     ON CONFLICT (report_type, report_id) DO UPDATE
-       SET payload = EXCLUDED.payload, processing_status = EXCLUDED.processing_status,
-           parsed_at = NULL
-     RETURNING raw_id`,
-    [
-      opts.connectionId,
-      opts.syncRunId,
-      'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
-      result.meta.reportId,
-      result.meta.reportDocumentId ?? null,
-      [opts.marketplaceId],
-      opts.periodStart.toISOString(),
-      opts.periodEnd.toISOString(),
-      result.meta.processingStatus,
-      JSON.stringify(parsed),
-      Buffer.byteLength(result.rawText, 'utf8'),
-    ],
-  );
-  const rawId = rawInsert.rows[0]!.raw_id;
+    // Parse from disk. readFileSync is fine for hundreds-of-MB files;
+    // it's the redundant in-memory copies in the old runReport path
+    // that were the problem.
+    const rawText = readFileSync(tmpPath, 'utf8');
+    const parsed = JSON.parse(rawText) as SqpReportResponse;
+    const rows = parsed.dataByAsin ?? [];
+
+    // 1. Land metadata in raw.sp_api_report — payload as an empty stub
+    //    since the real document is on disk for the duration of this call,
+    //    and could be huge. The reportDocumentId is preserved so the
+    //    original is re-fetchable via Amazon if needed.
+    const rawInsert = await opts.pg.query<{ raw_id: number }>(
+      `INSERT INTO raw.sp_api_report
+        (connection_id, sync_run_id, report_type, report_id, document_id, marketplace_ids,
+         data_start_time, data_end_time, processing_status, payload, payload_bytes, fetched_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '{}'::jsonb, $10, NOW())
+       ON CONFLICT (report_type, report_id) DO UPDATE
+         SET processing_status = EXCLUDED.processing_status, parsed_at = NULL
+       RETURNING raw_id`,
+      [
+        opts.connectionId,
+        opts.syncRunId,
+        'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
+        meta.reportId,
+        meta.reportDocumentId ?? null,
+        [opts.marketplaceId],
+        opts.periodStart.toISOString(),
+        opts.periodEnd.toISOString(),
+        meta.processingStatus,
+        bytesWritten,
+      ],
+    );
+    const rawId = rawInsert.rows[0]!.raw_id;
+
+    return await ingestParsedRows(opts, parsed, rows, rawId);
+  } finally {
+    // Clean up the temp file regardless of outcome.
+    try { unlinkSync(tmpPath); } catch { /* doesn't exist */ }
+  }
+}
+
+async function ingestParsedRows(
+  opts: IngestSqpPeriodOptions,
+  _parsed: SqpReportResponse,
+  rows: SearchQueryAsinRow[],
+  rawId: number,
+): Promise<{ rowsUpserted: number }> {
 
   // 2. Batched UPSERT — typical row count per (ASIN, month) is 50-200, so
   //    one batch covers most cases. Still chunk at 500 to be safe.

@@ -100,6 +100,81 @@ export async function runReport(client: SpApiClient, opts: RunReportOpts): Promi
 }
 
 /**
+ * createReport + poll + getDocument, then download the report body to a
+ * given file path (streaming, decompressed). Returns the file path and the
+ * report metadata. Use this when the response could be too large to fit
+ * in memory — caller can then read/parse the file in chunks or just
+ * `readFileSync` it if size is manageable.
+ *
+ * Background: the SQP reports for some ASINs have been crashing the
+ * buffer-everything path in runReport, even when the diagnostic showed
+ * earlier responses were small. This is the safe path for SQP.
+ */
+export async function downloadReportToFile(
+  client: SpApiClient,
+  opts: RunReportOpts,
+  filePath: string,
+): Promise<{ meta: GetReportResp; bytesWritten: number }> {
+  const create = await client.request<CreateReportResp>({
+    method: 'POST',
+    path: '/reports/2021-06-30/reports',
+    body: {
+      reportType: opts.reportType,
+      marketplaceIds: opts.marketplaceIds,
+      dataStartTime: opts.dataStartTime?.toISOString(),
+      dataEndTime: opts.dataEndTime?.toISOString(),
+      reportOptions: opts.reportOptions,
+    },
+  });
+
+  const reportId = create.payload.reportId;
+  let meta: GetReportResp;
+  let waitMs = 5_000;
+  const maxWaitMs = 60_000;
+
+  for (let i = 0; i < 60; i++) {
+    const got = await client.request<GetReportResp>({
+      method: 'GET',
+      path: `/reports/2021-06-30/reports/${reportId}`,
+    });
+    meta = got.payload;
+    if (meta.processingStatus === 'DONE') break;
+    if (meta.processingStatus === 'CANCELLED' || meta.processingStatus === 'FATAL') {
+      throw new Error(`Report ${reportId} ended with status ${meta.processingStatus}`);
+    }
+    await sleep(Math.min(waitMs, maxWaitMs));
+    waitMs = Math.min(waitMs * 1.5, maxWaitMs);
+  }
+
+  if (meta!.processingStatus !== 'DONE' || !meta!.reportDocumentId) {
+    throw new Error(`Report ${reportId} did not complete in time. Status: ${meta!.processingStatus}`);
+  }
+
+  const doc = await client.request<GetReportDocumentResp>({
+    method: 'GET',
+    path: `/reports/2021-06-30/documents/${meta!.reportDocumentId}`,
+  });
+
+  const fetched = await fetch(doc.payload.url);
+  if (!fetched.ok || !fetched.body) {
+    throw new Error(`Report document fetch failed (${fetched.status})`);
+  }
+
+  // Stream → optional gunzip → write to disk. Never buffers the whole body.
+  const { pipeline } = await import('node:stream/promises');
+  const { createWriteStream } = await import('node:fs');
+  const { statSync } = await import('node:fs');
+  const nodeStream = Readable.fromWeb(fetched.body as unknown as Parameters<typeof Readable.fromWeb>[0]);
+  if (doc.payload.compressionAlgorithm === 'GZIP') {
+    await pipeline(nodeStream, createGunzip(), createWriteStream(filePath));
+  } else {
+    await pipeline(nodeStream, createWriteStream(filePath));
+  }
+
+  return { meta: meta!, bytesWritten: statSync(filePath).size };
+}
+
+/**
  * Streaming variant of runReport — same createReport + poll + getDocument
  * dance, but returns a Node Readable that yields the (decompressed) report
  * body as bytes flow in, instead of buffering everything into a single
