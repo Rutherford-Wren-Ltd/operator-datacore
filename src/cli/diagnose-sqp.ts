@@ -75,8 +75,12 @@ async function main(): Promise<void> {
       month:         { type: 'string' },   // YYYY-MM, e.g. 2026-03
       week:          { type: 'string' },   // YYYY-MM-DD (any day in the desired Sun-Sat week)
       'months-back': { type: 'string' },   // shorthand: months back from current
+      asin:          { type: 'string' },   // required as of 2026-05-30 — Amazon's API rejects without it
     },
   });
+  if (!values.asin) {
+    throw new Error('--asin is required (Amazon SP-API rejects SQP requests without an asin reportOption since 2026-05-30)');
+  }
 
   const env = loadEnvForAmazonShared();
   const region: SpApiRegion = (values.region as SpApiRegion | undefined) ?? env.SP_API_REGION;
@@ -124,6 +128,7 @@ async function main(): Promise<void> {
   console.log(`  Marketplace:   ${marketplaceId}`);
   console.log(`  Period type:   ${periodType}`);
   console.log(`  Period:        ${period.start.toISOString().slice(0, 10)} → ${period.end.toISOString().slice(0, 10)}`);
+  console.log(`  ASIN:          ${values.asin}`);
   console.log('');
 
   const client = new SpApiClient({
@@ -143,7 +148,7 @@ async function main(): Promise<void> {
       marketplaceIds: [marketplaceId],
       dataStartTime: period.start.toISOString(),
       dataEndTime: period.end.toISOString(),
-      reportOptions: { reportPeriod: periodType },
+      reportOptions: { reportPeriod: periodType, asin: values.asin },
     },
   });
   const reportId = create.payload.reportId;
