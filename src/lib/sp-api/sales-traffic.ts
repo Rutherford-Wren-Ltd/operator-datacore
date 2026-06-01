@@ -16,7 +16,7 @@
 import pLimit from 'p-limit';
 import { Client as PgClient } from 'pg';
 import { SpApiClient } from './client.js';
-import { runReport } from './reports.js';
+import { runReport, ReportCancelledError } from './reports.js';
 import { getPgClient } from '../supabase.js';
 
 export interface SalesTrafficByAsinRow {
@@ -257,11 +257,27 @@ export async function backfillSalesTraffic(opts: {
   concurrency?: number;
   delayMs?: number;
   existingKeys?: Set<string>;
-  onProgress?: (info: { day: string; marketplace: string; rows: number; done: number; total: number }) => void;
+  onProgress?: (info: {
+    day: string;
+    marketplace: string;
+    rows: number;
+    done: number;
+    total: number;
+    /**
+     * TRUE when Amazon returned processingStatus=CANCELLED for this (day,
+     * marketplace). The day has no data and was skipped; `rows` is 0 in
+     * this case. Typically signals "outside the report's retention horizon"
+     * or "no sales in this period" rather than a real error — the run
+     * continues to the next day.
+     */
+    cancelled?: boolean;
+  }) => void;
 }): Promise<{
   totalDays: number;
   totalRows: number;
   tasksRun: number;
+  /** Days Amazon CANCELLED — usually retention-edge or no-sales days. */
+  tasksCancelled: number;
   tasksSkipped: number;
   /**
    * The active pg client at the end of the run. May not be the same instance
@@ -312,12 +328,13 @@ export async function backfillSalesTraffic(opts: {
   const tasksSkipped = allTasks.length - tasks.length;
 
   if (tasks.length === 0) {
-    return { totalDays: days.length, totalRows: 0, tasksRun: 0, tasksSkipped, pg: opts.pg };
+    return { totalDays: days.length, totalRows: 0, tasksRun: 0, tasksCancelled: 0, tasksSkipped, pg: opts.pg };
   }
 
   const limit = pLimit(effectiveConcurrency);
   let totalRows = 0;
   let done = 0;
+  let tasksCancelled = 0;
 
   // The pg connection is held open across 15-minute idle sleeps between calls.
   // Supabase's pooler kills idle connections, so without a keepalive the run
@@ -329,23 +346,46 @@ export async function backfillSalesTraffic(opts: {
   await Promise.all(
     tasks.map((t) =>
       limit(async () => {
-        const { rowsUpserted } = await ingestSalesTrafficDay({
-          spClient: opts.spClient,
-          pg: activePg,
-          connectionId: opts.connectionId,
-          syncRunId: opts.syncRunId,
-          marketplaceId: t.marketplaceId,
-          reportDate: t.day,
-        });
-        totalRows += rowsUpserted;
-        done++;
-        opts.onProgress?.({
-          day: t.day.toISOString().slice(0, 10),
-          marketplace: t.marketplaceId,
-          rows: rowsUpserted,
-          done,
-          total: tasks.length,
-        });
+        try {
+          const { rowsUpserted } = await ingestSalesTrafficDay({
+            spClient: opts.spClient,
+            pg: activePg,
+            connectionId: opts.connectionId,
+            syncRunId: opts.syncRunId,
+            marketplaceId: t.marketplaceId,
+            reportDate: t.day,
+          });
+          totalRows += rowsUpserted;
+          done++;
+          opts.onProgress?.({
+            day: t.day.toISOString().slice(0, 10),
+            marketplace: t.marketplaceId,
+            rows: rowsUpserted,
+            done,
+            total: tasks.length,
+          });
+        } catch (err) {
+          // Amazon's CANCELLED status means "no data for this window" — most
+          // commonly retention-edge dates (>24mo back) or marketplaces not
+          // enrolled in Brand Analytics for that period. Skip the day and
+          // continue so a single dead day doesn't kill a 90-day backfill.
+          // Anything else (FATAL, network, pg error) is a real problem; let
+          // it bubble to abort the run.
+          if (err instanceof ReportCancelledError) {
+            tasksCancelled++;
+            done++;
+            opts.onProgress?.({
+              day: t.day.toISOString().slice(0, 10),
+              marketplace: t.marketplaceId,
+              rows: 0,
+              done,
+              total: tasks.length,
+              cancelled: true,
+            });
+          } else {
+            throw err;
+          }
+        }
         if (done < tasks.length) {
           activePg = await sleepWithKeepalive(effectiveDelay, activePg);
         }
@@ -353,7 +393,7 @@ export async function backfillSalesTraffic(opts: {
     ),
   );
 
-  return { totalDays: days.length, totalRows, tasksRun: tasks.length, tasksSkipped, pg: activePg };
+  return { totalDays: days.length, totalRows, tasksRun: tasks.length - tasksCancelled, tasksCancelled, tasksSkipped, pg: activePg };
 }
 
 /**

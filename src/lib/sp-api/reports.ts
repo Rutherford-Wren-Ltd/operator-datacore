@@ -3,6 +3,24 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { Readable } from 'node:stream';
 import { SpApiClient } from './client.js';
 
+/**
+ * Thrown when Amazon ends a report with processingStatus=CANCELLED. This is
+ * a distinct condition from FATAL (which is "your request is malformed") —
+ * CANCELLED typically means "no data available for this window" (e.g. a date
+ * past the report's retention horizon, a marketplace not enrolled in Brand
+ * Analytics, an account that didn't sell in that period). Callers iterating
+ * over days / marketplaces / ASINs should catch this specifically and skip
+ * the failing tuple rather than aborting the whole run.
+ */
+export class ReportCancelledError extends Error {
+  readonly reportId: string;
+  constructor(reportId: string) {
+    super(`Report ${reportId} ended with status CANCELLED`);
+    this.name = 'ReportCancelledError';
+    this.reportId = reportId;
+  }
+}
+
 interface CreateReportResp {
   reportId: string;
 }
@@ -72,8 +90,11 @@ export async function runReport(client: SpApiClient, opts: RunReportOpts): Promi
     });
     meta = got.payload;
     if (meta.processingStatus === 'DONE') break;
-    if (meta.processingStatus === 'CANCELLED' || meta.processingStatus === 'FATAL') {
-      throw new Error(`Report ${reportId} ended with status ${meta.processingStatus}`);
+    if (meta.processingStatus === 'CANCELLED') {
+      throw new ReportCancelledError(reportId);
+    }
+    if (meta.processingStatus === 'FATAL') {
+      throw new Error(`Report ${reportId} ended with status FATAL`);
     }
     await sleep(Math.min(waitMs, maxWaitMs));
     waitMs = Math.min(waitMs * 1.5, maxWaitMs);
@@ -139,8 +160,11 @@ export async function downloadReportToFile(
     });
     meta = got.payload;
     if (meta.processingStatus === 'DONE') break;
-    if (meta.processingStatus === 'CANCELLED' || meta.processingStatus === 'FATAL') {
-      throw new Error(`Report ${reportId} ended with status ${meta.processingStatus}`);
+    if (meta.processingStatus === 'CANCELLED') {
+      throw new ReportCancelledError(reportId);
+    }
+    if (meta.processingStatus === 'FATAL') {
+      throw new Error(`Report ${reportId} ended with status FATAL`);
     }
     await sleep(Math.min(waitMs, maxWaitMs));
     waitMs = Math.min(waitMs * 1.5, maxWaitMs);
@@ -217,8 +241,11 @@ export async function streamReport(client: SpApiClient, opts: RunReportOpts): Pr
     });
     meta = got.payload;
     if (meta.processingStatus === 'DONE') break;
-    if (meta.processingStatus === 'CANCELLED' || meta.processingStatus === 'FATAL') {
-      throw new Error(`Report ${reportId} ended with status ${meta.processingStatus}`);
+    if (meta.processingStatus === 'CANCELLED') {
+      throw new ReportCancelledError(reportId);
+    }
+    if (meta.processingStatus === 'FATAL') {
+      throw new Error(`Report ${reportId} ended with status FATAL`);
     }
     await sleep(Math.min(waitMs, maxWaitMs));
     waitMs = Math.min(waitMs * 1.5, maxWaitMs);
