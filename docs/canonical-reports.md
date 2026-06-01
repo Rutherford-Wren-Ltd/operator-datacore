@@ -28,8 +28,8 @@ A real client (Dr Bo, May 2026): a dashboard built on Orders-Report-derived reve
 |---|---|---|---|---|---|
 | **Revenue, units, sessions, page views, buy box, conversion** | `GET_SALES_AND_TRAFFIC_REPORT` | `brain.sales_traffic_daily` | Day × child ASIN | 24-48h | **YES** |
 | Order-level detail (date, qty, status, ship-to country) | `GET_FLAT_FILE_ALL_ORDERS_DATA_BY_LAST_UPDATE_GENERAL` | `brain.orders` + `brain.order_items` | Order line | 30-60 min | **active** (CLI: `npm run ingest-orders`; chunks <=30 days per call) |
-| Fees (referral, FBA, storage, etc.) | `Finances API → listFinancialEvents` | `brain.financial_events` | Event | 24-48h | scaffolded |
-| Refunds (financial side) | `Finances API → listFinancialEvents` (RefundEvent type) | `brain.refund_events` (view) | Event | 24-48h | scaffolded |
+| Fees (referral, FBA, storage, etc.) | `Finances API → listFinancialEvents` | `brain.financial_events` | Event | 24-48h | **active** (CLI: `npm run ingest-finances`). Parses ShipmentEvent, RefundEvent, ServiceFeeEvent, AdjustmentEvent, ProductAdsPaymentEvent in v1; other event types land raw only |
+| Refunds (financial side) | `Finances API → listFinancialEvents` (RefundEvent type) | `brain.refund_events` (view) | Event | 24-48h | **active** (lands via `npm run ingest-finances`; the view joins to brain.orders by amazon_order_id) |
 | Refunds (physical side) | `GET_FBA_FULFILLMENT_CUSTOMER_RETURNS_DATA` | `brain.fba_returns` | Return | 24h | scaffolded |
 | Payouts to bank | `GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2` | `brain.settlements` + `brain.settlement_lines` | Settlement | 14-day rolling | scaffolded |
 | FBA inventory snapshot | `GET_FBA_MYI_UNSUPPRESSED_INVENTORY_DATA` | `brain.fba_inventory_snapshot` | Day × SKU | 6h | scaffolded |
