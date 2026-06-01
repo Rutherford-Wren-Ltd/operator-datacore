@@ -1,32 +1,43 @@
 // ============================================================================
-// Sponsored Brands — daily purchased-product report → brain.ads_sb_daily.
+// Sponsored Brands — daily ingest → brain.ads_sb_daily.
 //
-// Report type: sbPurchasedProduct (Amazon Ads API v3, adProduct = SPONSORED_BRANDS)
-// Granularity: campaign + ad group + PURCHASED ASIN + date
+// SB takes TWO reports to assemble the full picture, because Amazon's v3
+// API splits SB metrics across report types:
 //
-// What's different about SB vs SP/SD:
+//   1. sbPurchasedProduct  → per-purchased-ASIN attributed sales / units.
+//                            NO impressions / clicks / cost.
+//   2. sbCampaigns         → per-campaign impressions / clicks / cost +
+//                            campaign-level attributed sales (for sanity).
+//                            NO per-ASIN breakdown.
 //
-//   - SB ads promote a BRAND / Store, not a single ASIN, so there's no
-//     "advertised ASIN" — the equivalent is `purchasedAsin`: the ASIN(s)
-//     a customer actually bought after clicking the SB ad.
-//   - Cost and impressions are reported at the campaign/ad-group level, NOT
-//     at the purchased-ASIN level. The `sbPurchasedProduct` report intentionally
-//     omits impressions/clicks/cost — those come from `sbCampaigns` /
-//     `sbAdGroup` (a separate ingest, follow-up).
-//   - Attribution is the 14-day window (same convention as SD).
+// SB ads promote a brand / Store / multi-ASIN showcase — there's no
+// per-ASIN advertised entity, so cost lives at the campaign grain and
+// sales attribute to whichever products the customer bought after the
+// click. The two reports are designed to be joined, not collapsed.
 //
 // Schema mapping into brain.ads_sb_daily (shared shape with SP/SD via
 // `LIKE brain.ads_sp_daily INCLUDING ALL` from migration 0003):
-//   - entity_key = purchasedAsin (or '' fallback)
-//   - sales_14d  = sales14d from the report
-//   - units_sold_14d = unitsSold14d
-//   - impressions / clicks / cost = 0 for now (sbCampaigns ingest is a
-//     Phase 7 follow-up that will UPDATE the matching campaign-level row).
-//   - Other sales_* / units_sold_* windows = 0 (SB only attributes to 14d).
 //
-// What this enables today: per-ASIN attributed SB sales, joinable to S&T
-// for "where did SB drive purchases?" Doesn't yet enable per-ASIN SB TACoS
-// — that needs the campaign-cost follow-up.
+//   - sbPurchasedProduct rows:
+//       ad_group_id = adGroupId from report (or '' if absent)
+//       entity_key  = purchasedAsin
+//       sales_14d, units_sold_14d populated
+//       impressions / clicks / cost = 0
+//
+//   - sbCampaigns rows:
+//       ad_group_id = ''
+//       entity_key  = 'campaign'        ← distinguishes from purchased-ASIN rows
+//       impressions, clicks, cost populated
+//       sales_14d, units_sold_14d also populated (campaign-level total)
+//
+// The two row types have disjoint PKs (entity_key='campaign' vs ASIN), so
+// they coexist in the same table without collision. Analytics views can
+// JOIN them by (metric_date, profile_id, campaign_id) to spread the
+// campaign cost across the per-ASIN sales by sales share — the canonical
+// approach for per-ASIN SB TACoS.
+//
+// Both reports fire in parallel inside `ingestSbDaily`; quota footprint
+// for one (profile, date) is 2 SB reports concurrent on Amazon's side.
 // ============================================================================
 
 import type { Client as PgClient } from 'pg';
@@ -38,6 +49,10 @@ import {
   type GetReportResponse,
   type PollOptions,
 } from './reports.js';
+
+// ---------------------------------------------------------------------------
+// sbPurchasedProduct — per-purchased-ASIN attributed sales / units.
+// ---------------------------------------------------------------------------
 
 const SB_PURCHASED_PRODUCT_COLUMNS = [
   'date',
@@ -53,11 +68,37 @@ interface SbPurchasedProductRow {
   campaignId: string | number;
   adGroupId?: string | number;
   purchasedAsin?: string;
-  /** 14-day attributed sales for purchases after an SB ad interaction. */
   sales14d?: number;
-  /** 14-day attributed units sold. */
   unitsSold14d?: number;
 }
+
+// ---------------------------------------------------------------------------
+// sbCampaigns — campaign-level impressions / clicks / cost / sales.
+// ---------------------------------------------------------------------------
+
+const SB_CAMPAIGNS_COLUMNS = [
+  'date',
+  'campaignId',
+  'impressions',
+  'clicks',
+  'cost',
+  'sales14d',
+  'unitsSold14d',
+] as const;
+
+interface SbCampaignsRow {
+  date: string;
+  campaignId: string | number;
+  impressions?: number;
+  clicks?: number;
+  cost?: number;
+  sales14d?: number;
+  unitsSold14d?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Public API.
+// ---------------------------------------------------------------------------
 
 export interface IngestSbOptions {
   adsClient: AdsApiClient;
@@ -73,20 +114,51 @@ export interface IngestSbOptions {
 }
 
 export interface IngestSbResult {
+  /** "<purchasedReportId>+<campaignsReportId>" — both reports' IDs, for traceability. */
   reportId: string;
+  /** "COMPLETED" if both reports completed, "PARTIAL" otherwise. */
   status: string;
   rowsFetched: number;
   rowsUpserted: number;
 }
 
 /**
- * End-to-end SB ingest: create → poll → download → upsert.
- * Idempotent for the same date range — re-running replaces rows for that window.
+ * End-to-end SB ingest: fires sbPurchasedProduct + sbCampaigns in parallel,
+ * upserts both row types into brain.ads_sb_daily. Idempotent for the same
+ * date range.
  *
  * Returns 0 rows when the profile has no SB campaigns for the date — that's
  * normal (many RW profiles run SP+SD but no SB) and not an error.
  */
 export async function ingestSbDaily(opts: IngestSbOptions): Promise<IngestSbResult> {
+  const [purchased, campaigns] = await Promise.all([
+    ingestSbPurchasedProduct(opts),
+    ingestSbCampaigns(opts),
+  ]);
+
+  return {
+    reportId: `${purchased.reportId}+${campaigns.reportId}`,
+    status:
+      purchased.status === 'COMPLETED' && campaigns.status === 'COMPLETED'
+        ? 'COMPLETED'
+        : 'PARTIAL',
+    rowsFetched: purchased.rowsFetched + campaigns.rowsFetched,
+    rowsUpserted: purchased.rowsUpserted + campaigns.rowsUpserted,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Internals.
+// ---------------------------------------------------------------------------
+
+interface SubResult {
+  reportId: string;
+  status: string;
+  rowsFetched: number;
+  rowsUpserted: number;
+}
+
+async function ingestSbPurchasedProduct(opts: IngestSbOptions): Promise<SubResult> {
   const created = await createReport(opts.adsClient, {
     name: `operator-datacore SB purchased-product ${opts.startDate}_${opts.endDate}`,
     startDate: opts.startDate,
@@ -106,7 +178,6 @@ export async function ingestSbDaily(opts: IngestSbOptions): Promise<IngestSbResu
     created.reportId,
     opts.poll ?? {},
   );
-
   const rows = await downloadReport<SbPurchasedProductRow>(completed.url!);
 
   let upserted = 0;
@@ -146,6 +217,83 @@ export async function ingestSbDaily(opts: IngestSbOptions): Promise<IngestSbResu
         adGroupId,
         entityKey,
         asin,
+        r.sales14d ?? 0,
+        r.unitsSold14d ?? 0,
+        opts.currencyCode,
+      ],
+    );
+    upserted += 1;
+  }
+
+  return {
+    reportId: created.reportId,
+    status: completed.status,
+    rowsFetched: rows.length,
+    rowsUpserted: upserted,
+  };
+}
+
+async function ingestSbCampaigns(opts: IngestSbOptions): Promise<SubResult> {
+  const created = await createReport(opts.adsClient, {
+    name: `operator-datacore SB campaigns ${opts.startDate}_${opts.endDate}`,
+    startDate: opts.startDate,
+    endDate: opts.endDate,
+    configuration: {
+      adProduct: 'SPONSORED_BRANDS',
+      groupBy: ['campaign'],
+      columns: [...SB_CAMPAIGNS_COLUMNS],
+      reportTypeId: 'sbCampaigns',
+      timeUnit: 'DAILY',
+      format: 'GZIP_JSON',
+    },
+  });
+
+  const completed: GetReportResponse = await pollReport(
+    opts.adsClient,
+    created.reportId,
+    opts.poll ?? {},
+  );
+  const rows = await downloadReport<SbCampaignsRow>(completed.url!);
+
+  let upserted = 0;
+  for (const r of rows) {
+    const campaignId = String(r.campaignId);
+
+    // Campaign-level rows always land with ad_group_id='' + entity_key='campaign'
+    // so they don't collide with the per-purchased-ASIN rows from
+    // sbPurchasedProduct (which use entity_key=ASIN).
+    await opts.pg.query(
+      `INSERT INTO brain.ads_sb_daily (
+        metric_date, profile_id, campaign_id, ad_group_id, entity_key,
+        keyword_id, target_id, asin, sku,
+        impressions, clicks, cost,
+        sales_1d, sales_7d, sales_14d, sales_30d,
+        units_sold_1d, units_sold_7d, units_sold_14d, units_sold_30d,
+        currency_code, raw_id, ingested_at
+      ) VALUES (
+        $1, $2, $3, '', 'campaign',
+        NULL, NULL, NULL, NULL,
+        $4, $5, $6,
+        0, 0, $7, 0,
+        0, 0, $8, 0,
+        $9, NULL, NOW()
+      )
+      ON CONFLICT (metric_date, campaign_id, ad_group_id, entity_key) DO UPDATE SET
+        profile_id        = EXCLUDED.profile_id,
+        impressions       = EXCLUDED.impressions,
+        clicks            = EXCLUDED.clicks,
+        cost              = EXCLUDED.cost,
+        sales_14d         = EXCLUDED.sales_14d,
+        units_sold_14d    = EXCLUDED.units_sold_14d,
+        currency_code     = EXCLUDED.currency_code,
+        ingested_at       = NOW()`,
+      [
+        r.date,
+        opts.profileId,
+        campaignId,
+        r.impressions ?? 0,
+        r.clicks ?? 0,
+        r.cost ?? 0,
         r.sales14d ?? 0,
         r.unitsSold14d ?? 0,
         opts.currencyCode,
