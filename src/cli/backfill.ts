@@ -251,7 +251,11 @@ async function main(): Promise<void> {
       ...(existingKeys ? { existingKeys } : {}),
       onProgress: (info) => {
         const pct = ((info.done / info.total) * 100).toFixed(1).padStart(5);
-        console.log(`  [${pct}%] ${info.day} ${info.marketplace.padEnd(15)} → ${info.rows} ASIN rows`);
+        if (info.cancelled) {
+          console.log(`  [${pct}%] ${info.day} ${info.marketplace.padEnd(15)} → CANCELLED (no data; skipped)`);
+        } else {
+          console.log(`  [${pct}%] ${info.day} ${info.marketplace.padEnd(15)} → ${info.rows} ASIN rows`);
+        }
       },
     });
 
@@ -273,8 +277,17 @@ async function main(): Promise<void> {
     console.log('');
     console.log(
       `Done in ${durationMin} min. ${result.tasksRun} call(s) made, ${result.tasksSkipped} skipped, ` +
+      `${result.tasksCancelled} cancelled (no data), ` +
       `${result.totalRows} ASIN rows upserted across ${marketplaceIds.length} marketplace(s).`,
     );
+    if (result.tasksCancelled > 0) {
+      console.log(
+        `Note: ${result.tasksCancelled} day(s) returned CANCELLED — usually the retention edge ` +
+        `(${'>'}24mo old) or a marketplace without Brand Analytics for that period. Those days ` +
+        `have no rows in brain.sales_traffic_daily, so --skip-existing will retry them on the ` +
+        `next run — Amazon will CANCEL again and the loop skips again. Safe, just noisy.`,
+      );
+    }
     console.log('Next: run  npm run verify  to compare against Seller Central.');
   } finally {
     await pg.end();
