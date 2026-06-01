@@ -44,6 +44,7 @@
     "ads-probe": "tsx src/cli/ads-probe.ts",
     "ads-exchange-code": "tsx src/cli/ads-exchange-code.ts",
     "ads-ingest": "tsx src/cli/ads-ingest.ts",
+    "ingest-orders": "tsx src/cli/ingest-orders.ts",
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "import-masters": "tsx src/cli/import-masters.ts",
     "import-fba-fees": "tsx src/cli/import-fba-fees.ts",
