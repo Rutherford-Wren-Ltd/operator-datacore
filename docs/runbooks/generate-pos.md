@@ -57,13 +57,22 @@ split destinations.
 
 Draft POs land in `brain.purchase_orders` with `source_system = 'restock_engine'`,
 `status = 'draft'`, and a provisional number `RX-<supplier_id>` (e.g. `RX-SUP-009`).
-Their lines sit at `destination = 'unallocated'`, `serves_region = 'unallocated'`.
+Each SKU produces **one or two lines** — one per region that has a non-zero gap:
+
+| `serves_region` | Default `destination` | When |
+|---|---|---|
+| `uk_eu` | `fba_direct` | UK/EU gap > 0 |
+| `na`    | `usa_awd`    | NA gap > 0 |
+
+The qty on each line is the SKU's `proposedQty` split in proportion to the per-region
+gap. Excess units from MOQ rounding land on the larger-gap region.
 
 For each PO you approve:
 
-1. **Assign destinations.** Decide where each line's stock should land (FBA UK, USA AWD,
-   UK 3PL, RW-held) and set `destination` + `serves_region` on the line. The per-region
-   need in the line `notes` tells you the split.
+1. **Confirm or override the destination.** UK lines default to `fba_direct` (direct to
+   FBA). Flip to `uk_3pl_lemonpath` if you'd rather hold stock at the 3PL first. NA is
+   forced to `usa_awd` (the only NA destination in the lifecycle). The per-region need
+   in the line `notes` confirms the split for you.
 2. **Allocate the real PO number.** Rename `po_number` from `RX-...` to the real PO
    number once you have one.
 3. **Promote it.** `npm run set-po-status -- --po <real-number> --status placed --date <YYYY-MM-DD>`.
