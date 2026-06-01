@@ -19,7 +19,16 @@ export async function getPgClient(): Promise<PgClient> {
   const client = new PgClient({
     connectionString: env.SUPABASE_DB_URL,
     ssl: env.SUPABASE_DB_URL.includes('localhost') ? undefined : { rejectUnauthorized: false },
+    // Fail-fast on a stuck connect (default is wait-forever). Catches the
+    // pooler-exhaustion / DNS-hang case loudly instead of silently. Statement
+    // timeout caps any individual query at 5 minutes — enough for big upserts,
+    // short enough that an accidental table scan doesn't lock up a process.
+    connectionTimeoutMillis: 10_000,
+    statement_timeout: 300_000,
   });
+  const started = Date.now();
   await client.connect();
+  const host = new URL(env.SUPABASE_DB_URL.replace(/^postgres(ql)?:/, 'http:')).host;
+  console.log(`[pg] connected to ${host} in ${Date.now() - started}ms`);
   return client;
 }

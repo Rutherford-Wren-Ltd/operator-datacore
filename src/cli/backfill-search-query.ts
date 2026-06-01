@@ -36,6 +36,7 @@
 import { parseArgs } from 'node:util';
 import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '../lib/env.js';
 import { getPgClient } from '../lib/supabase.js';
+import { checkpoint } from '../lib/checkpoint.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { backfillSqp, listPeriods, type SqpPeriodType } from '../lib/sp-api/search-query.js';
 
@@ -263,12 +264,16 @@ function backwardCountWindow(periodType: SqpPeriodType, count: number): { from: 
 }
 
 async function main(): Promise<void> {
+  checkpoint('main:start');
   const args = parseCliArgs();
+  checkpoint('parseCliArgs done');
 
   const env = loadEnvForAmazonShared();
+  checkpoint('env loaded');
   const region: SpApiRegion = args.region ?? env.SP_API_REGION;
   const regionConfig = getSpApiRegionConfig(region, env);
   let marketplaceIds = regionConfig.marketplaceIds;
+  checkpoint('region resolved');
 
   if (args.marketplaceFilter) {
     const outOfRegion = args.marketplaceFilter.filter((id) => !marketplaceIds.includes(id));
@@ -295,6 +300,7 @@ async function main(): Promise<void> {
   }
 
   const periods = listPeriods(args.periodType, fromDate, toDate);
+  checkpoint('period window resolved');
 
   console.log('operator-datacore — Brand Analytics SQP backfill');
   console.log('-------------------------------------------------');
@@ -315,10 +321,15 @@ async function main(): Promise<void> {
     clientSecret: env.SP_API_LWA_CLIENT_SECRET,
     refreshToken: regionConfig.refreshToken,
   });
+  checkpoint('SpApiClient constructed');
+  checkpoint('before getPgClient');
   let pg = await getPgClient();
+  checkpoint('after getPgClient');
 
   // Resolve the ASIN set (requires pg for sku_master / sales_traffic lookups).
+  checkpoint('before resolveAsins');
   const asins = await resolveAsins(pg, args, marketplaceIds);
+  checkpoint('after resolveAsins');
   if (asins.length === 0) {
     throw new Error(
       'No ASINs resolved. Specify --asins, --brands, --top-n, or ensure brain.sku_master has active rows.',
@@ -349,6 +360,7 @@ async function main(): Promise<void> {
   }
 
   try {
+    checkpoint('before meta.connection upsert');
     const { rows: connRows } = await pg.query<{ connection_id: string }>(
       `INSERT INTO meta.connection (source, label, region, marketplace_ids, status)
        VALUES ('amazon_sp_api', $1, $2, $3, 'active')
@@ -360,7 +372,9 @@ async function main(): Promise<void> {
       [`amazon-${regionConfig.region}`, regionConfig.region, marketplaceIds],
     );
     const connectionId = connRows[0]!.connection_id;
+    checkpoint('after meta.connection upsert');
 
+    checkpoint('before meta.sync_run insert');
     const { rows: runRows } = await pg.query<{ sync_run_id: string }>(
       `INSERT INTO meta.sync_run (connection_id, source, object, mode, window_start, window_end)
        VALUES ($1, 'amazon_sp_api', 'search_query_performance_report', 'backfill', $2, $3)
@@ -368,6 +382,7 @@ async function main(): Promise<void> {
       [connectionId, fromDate.toISOString(), toDate.toISOString()],
     );
     const syncRunId = runRows[0]!.sync_run_id;
+    checkpoint('after meta.sync_run insert');
 
     let existingKeys: Set<string> | undefined;
     if (args.skipExisting) {
@@ -376,6 +391,7 @@ async function main(): Promise<void> {
       console.log('');
     }
 
+    checkpoint('before backfillSqp');
     const startedAt = Date.now();
     const result = await backfillSqp({
       spClient,
@@ -398,6 +414,7 @@ async function main(): Promise<void> {
     const durationMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
 
     pg = result.pg;
+    checkpoint('after backfillSqp');
 
     await pg.query(
       `UPDATE meta.sync_run
