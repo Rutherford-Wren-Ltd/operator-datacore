@@ -9,15 +9,21 @@
 // late evening; sticking to D-1 avoids partial-day rows).
 //
 // Usage:
-//   npm run ads-ingest                            # yesterday, SP + SD, primary region
+//   npm run ads-ingest                            # yesterday, SP + SD (default), primary region
 //   npm run ads-ingest -- --region NA             # primary-region default, NA override
 //   npm run ads-ingest -- --days 7                # last 7 days, SP + SD
 //   npm run ads-ingest -- --date 2026-05-14       # one specific date
 //   npm run ads-ingest -- --from 2024-01-01 --to 2024-12-31 --skip-existing
 //                                                 # historical backfill, idempotent re-runs
 //   npm run ads-ingest -- --products SP           # SP only
-//   npm run ads-ingest -- --products SD           # SD only
+//   npm run ads-ingest -- --products SP,SD,SB     # opt SB into a run
 //   npm run ads-ingest -- --concurrency 3         # 3 profiles in parallel per date (default 1)
+//
+// Sponsored Brands (SB) is OPT-IN via --products SP,SD,SB. The default
+// stays SP+SD so the existing daily-sync schedule keeps the same
+// concurrent-report footprint until SB has been validated against
+// production profiles. Once verified, daily-sync.yml + ads-attribution-ripen.yml
+// can be updated to explicitly include SB.
 //
 // Backfill mode (--from/--to):
 //   - Hard-capped at 1100 days (~3 years) to avoid an accidental decade-long run.
@@ -26,18 +32,18 @@
 //     dropped from the worklist. Use this for crash recovery or topping up gaps.
 //
 // Concurrency:
-//   - SP + SD for one (profile, date) always run in parallel — separate
-//     report types, separate quota buckets on Amazon's side.
+//   - SP + SD + SB for one (profile, date) always run in parallel —
+//     separate report types, separate quota buckets on Amazon's side.
 //   - Across profiles, the default is sequential (--concurrency 1) because
 //     Amazon's createReport rate limits and concurrent-report ceilings
 //     are PER LWA APP, not per profile. Running 9 profiles' worth of
-//     reports at once = up to 18 concurrent reports per app, which risks
-//     429s on most accounts.
-//   - --concurrency 2-3 is usually safe for accounts that have been on
+//     reports at once = up to 27 concurrent reports per app (3 products
+//     × 9 profiles), which risks 429s on most accounts.
+//   - --concurrency 2 is usually safe for accounts that have been on
 //     the Ads API for a while. New apps with default quotas should stay
 //     at 1 until they have usage history.
-//   - Within each batch of N profiles, SP+SD still run in parallel —
-//     effective concurrency is 2N concurrent reports.
+//   - Within each batch of N profiles, SP+SD+SB still run in parallel —
+//     effective concurrency is 3N concurrent reports.
 // ============================================================================
 
 import { parseArgs } from 'node:util';
@@ -52,8 +58,9 @@ import { AdsApiClient } from '../lib/ads-api/client.js';
 import { getProfiles, type AdsProfile } from '../lib/ads-api/profiles.js';
 import { ingestSpDaily } from '../lib/ads-api/sp-ingest.js';
 import { ingestSdDaily } from '../lib/ads-api/sd-ingest.js';
+import { ingestSbDaily } from '../lib/ads-api/sb-ingest.js';
 
-type AdProductKey = 'SP' | 'SD';
+type AdProductKey = 'SP' | 'SD' | 'SB';
 
 interface ProfileDateSuccess {
   ok: true;
@@ -169,7 +176,7 @@ async function main(): Promise<void> {
 
   try {
     const startedAt = Date.now();
-    const totals: Record<AdProductKey, number> = { SP: 0, SD: 0 };
+    const totals: Record<AdProductKey, number> = { SP: 0, SD: 0, SB: 0 };
     const failures: ProfileDateFailure[] = [];
     let successCount = 0;
     let skippedCount = 0;
@@ -334,7 +341,7 @@ async function ingestProfileDate(opts: IngestProfileDateOpts): Promise<ProfileDa
       },
     });
 
-    const byProduct: ProfileDateSuccess['byProduct'] = { SP: undefined, SD: undefined };
+    const byProduct: ProfileDateSuccess['byProduct'] = { SP: undefined, SD: undefined, SB: undefined };
     const jobs: Array<Promise<void>> = [];
     if (products.includes('SP')) {
       jobs.push(
@@ -363,6 +370,21 @@ async function ingestProfileDate(opts: IngestProfileDateOpts): Promise<ProfileDa
           poll: pollLogger('SD'),
         }).then((r) => {
           byProduct.SD = { rows: r.rowsUpserted, reportId: r.reportId };
+        }),
+      );
+    }
+    if (products.includes('SB')) {
+      jobs.push(
+        ingestSbDaily({
+          adsClient: scopedClient,
+          pg,
+          profileId,
+          startDate: date,
+          endDate: date,
+          currencyCode: profile.currencyCode,
+          poll: pollLogger('SB'),
+        }).then((r) => {
+          byProduct.SB = { rows: r.rowsUpserted, reportId: r.reportId };
         }),
       );
     }
@@ -402,7 +424,10 @@ async function loadCompletedPairs(
   // Table names are derived from a controlled enum, not user input — safe.
   const productSets: Set<string>[] = [];
   for (const product of products) {
-    const table = product === 'SP' ? 'brain.ads_sp_daily' : 'brain.ads_sd_daily';
+    const table =
+      product === 'SP' ? 'brain.ads_sp_daily' :
+      product === 'SD' ? 'brain.ads_sd_daily' :
+                          'brain.ads_sb_daily';
     const { rows } = await pg.query<{ profile_id: string; metric_date: string }>(
       `SELECT DISTINCT profile_id, to_char(metric_date, 'YYYY-MM-DD') AS metric_date
          FROM ${table}
@@ -481,21 +506,24 @@ function resolveDates(
 }
 
 function resolveProducts(products: string | undefined): AdProductKey[] {
+  // Default keeps SP+SD only — SB is opt-in (see CLI header note).
   if (!products) return ['SP', 'SD'];
   const parsed = products
     .split(',')
     .map((s) => s.trim().toUpperCase())
-    .filter((s): s is AdProductKey => s === 'SP' || s === 'SD');
+    .filter((s): s is AdProductKey => s === 'SP' || s === 'SD' || s === 'SB');
   if (parsed.length === 0) {
-    throw new Error(`--products must be a comma-separated list of: SP, SD. Got "${products}".`);
+    throw new Error(`--products must be a comma-separated list of: SP, SD, SB. Got "${products}".`);
   }
   return parsed;
 }
 
 /**
  * Resolve and validate --concurrency. Hard-caps at 5 to avoid blowing past
- * typical Ads API concurrent-report ceilings (each batched profile adds
- * 2 concurrent reports — SP + SD — so 5 profiles = 10 concurrent reports).
+ * typical Ads API concurrent-report ceilings. With SP + SD + SB defaulting
+ * on, each batched profile adds up to 3 concurrent reports — so 5 profiles
+ * = up to 15 concurrent reports. Already in the territory where a default
+ * Ads API quota will start 429ing; raise only if your account quota allows.
  */
 function resolveConcurrency(value: string | undefined): number {
   if (!value) return 1;

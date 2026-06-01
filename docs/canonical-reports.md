@@ -39,9 +39,9 @@ A real client (Dr Bo, May 2026): a dashboard built on Orders-Report-derived reve
 | Listings (your offers) | `Listings Items API → getListingsItem` | `brain.listings_items` | Per SKU | realtime | scaffolded |
 | Search query performance | `GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT` | `brain.search_query_performance` | Period × ASIN × query | 1 week | **active** (CLI: `npm run backfill-search-query`; daily-sync hook is a Phase 7 follow-up) |
 | Subscribe & Save | `Replenishment API → listOffers` | `brain.subscribe_save_offers` | Offer × day | 24h | scaffolded |
-| Sponsored Products spend | **Amazon Ads API v3** → `spAdvertisedProduct` report | `brain.ads_sp_daily` | Day × campaign × ad group × target | 24-48h | scaffolded |
-| Sponsored Brands spend | **Amazon Ads API v3** → `sbPurchasedProduct` | `brain.ads_sb_daily` | Day | 24-48h | scaffolded |
-| Sponsored Display spend | **Amazon Ads API v3** → `sdAdvertisedProduct` | `brain.ads_sd_daily` | Day | 24-48h | scaffolded |
+| Sponsored Products spend | **Amazon Ads API v3** → `spAdvertisedProduct` | `brain.ads_sp_daily` | Day × campaign × ad group × target | 24-48h | **active** (CLI: `npm run ads-ingest`, included by default) |
+| Sponsored Brands attributed sales | **Amazon Ads API v3** → `sbPurchasedProduct` | `brain.ads_sb_daily` | Day × campaign × ad group × purchased ASIN | 24-48h | **active (opt-in)** (CLI: `npm run ads-ingest -- --products SP,SD,SB`). `sbPurchasedProduct` does NOT carry impressions / clicks / cost — those need a follow-up `sbCampaigns` ingest |
+| Sponsored Display spend | **Amazon Ads API v3** → `sdAdvertisedProduct` | `brain.ads_sd_daily` | Day × campaign × ad group × promoted ASIN | 24-48h | **active** (CLI: `npm run ads-ingest`, included by default) |
 
 **Notes:**
 
