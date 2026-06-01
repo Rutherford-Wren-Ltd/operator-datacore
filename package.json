@@ -45,6 +45,7 @@
     "ads-exchange-code": "tsx src/cli/ads-exchange-code.ts",
     "ads-ingest": "tsx src/cli/ads-ingest.ts",
     "ingest-orders": "tsx src/cli/ingest-orders.ts",
+    "forecast": "tsx src/cli/forecast.ts",
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "import-masters": "tsx src/cli/import-masters.ts",
     "import-fba-fees": "tsx src/cli/import-fba-fees.ts",
