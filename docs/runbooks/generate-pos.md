@@ -22,6 +22,14 @@ supplier, one draft PO each, with the per-region breakdown for every proposed SK
 
 Always do a `--dry-run` first and read the report before the real run.
 
+> **Automated weekly run:** GitHub Actions workflow `restock-engine-weekly.yml`
+> runs the engine every **Monday at 06:00 UTC** (07:00 BST / 06:00 GMT — before
+> Chris's 07:00 UK working window) and opens a team-review issue titled
+> "Restock proposals — YYYY-MM-DD — N SKU(s) triggered" with the full report
+> inline. The same idempotency contract applies: any `restock_engine` PO still
+> at `status='draft'` on the next Monday is replaced, so promote what you want
+> to keep with `set-po-status` before then.
+
 ---
 
 ## What it does
