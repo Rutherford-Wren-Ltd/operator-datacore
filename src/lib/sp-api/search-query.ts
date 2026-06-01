@@ -33,38 +33,15 @@
 // ============================================================================
 
 import { Client as PgClient } from 'pg';
-import { createReadStream, createWriteStream, unlinkSync, mkdirSync, statSync } from 'node:fs';
-import { Readable } from 'node:stream';
-import { pipeline as streamPipeline } from 'node:stream/promises';
-import { createGunzip } from 'node:zlib';
+import { createReadStream, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import parserStream from 'stream-json';
 import pick from 'stream-json/filters/pick.js';
 import streamArray from 'stream-json/streamers/stream-array.js';
 import { SpApiClient } from './client.js';
+import { downloadReportToFile } from './reports.js';
 import { getPgClient } from '../supabase.js';
-import { checkpoint } from '../checkpoint.js';
-
-interface CreateReportResp {
-  reportId: string;
-}
-interface GetReportResp {
-  reportId: string;
-  reportType: string;
-  dataStartTime?: string;
-  dataEndTime?: string;
-  marketplaceIds?: string[];
-  reportDocumentId?: string;
-  processingStatus: 'IN_QUEUE' | 'IN_PROGRESS' | 'DONE' | 'CANCELLED' | 'FATAL';
-  processingStartTime?: string;
-  processingEndTime?: string;
-}
-interface GetReportDocumentResp {
-  reportDocumentId: string;
-  url: string;
-  compressionAlgorithm?: 'GZIP';
-}
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -148,83 +125,21 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
   try { mkdirSync(tmpRoot, { recursive: true }); } catch { /* exists */ }
   const tmpPath = join(tmpRoot, `sqp-${opts.marketplaceId}-${opts.asin}-${opts.periodStart.toISOString().slice(0,10)}-${Date.now()}.json`);
 
-  // ------------------------------------------------------------------------
-  // Inlined createReport + poll + getReportDocument + stream-to-disk.
-  //
-  // Why inlined (vs. calling downloadReportToFile): we're diagnosing the SQP
-  // OOM and need a per-poll memory checkpoint to discriminate A1 (per-poll
-  // leak — heap climbs poll-by-poll) from A2 (download buffering at DONE —
-  // heap flat through polls, jumps on download). Adding an onPoll callback
-  // to the shared helper would be a behavioural change to other callers;
-  // inlining keeps the helper untouched.
-  // ------------------------------------------------------------------------
-  let meta: GetReportResp;
+  let meta: { reportId: string; reportDocumentId?: string; processingStatus: string };
   let bytesWritten: number;
   try {
-    checkpoint(`ingestSqp[${opts.marketplaceId}/${opts.asin}] before createReport`);
-    const create = await opts.spClient.request<CreateReportResp>({
-      method: 'POST',
-      path: '/reports/2021-06-30/reports',
-      body: {
-        reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
-        marketplaceIds: [opts.marketplaceId],
-        dataStartTime: opts.periodStart.toISOString(),
-        dataEndTime: opts.periodEnd.toISOString(),
-        reportOptions: {
-          reportPeriod: opts.periodType,
-          asin: opts.asin,
-        },
+    const downloadResult = await downloadReportToFile(opts.spClient, {
+      reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
+      marketplaceIds: [opts.marketplaceId],
+      dataStartTime: opts.periodStart,
+      dataEndTime: opts.periodEnd,
+      reportOptions: {
+        reportPeriod: opts.periodType,
+        asin: opts.asin,
       },
-    });
-    const reportId = create.payload.reportId;
-    checkpoint(`createReport returned ${reportId}`);
-
-    let pollMeta: GetReportResp | undefined;
-    let waitMs = 5_000;
-    const maxWaitMs = 60_000;
-    for (let i = 0; i < 60; i++) {
-      checkpoint(`poll ${i + 1} before getReport`);
-      const got = await opts.spClient.request<GetReportResp>({
-        method: 'GET',
-        path: `/reports/2021-06-30/reports/${reportId}`,
-      });
-      pollMeta = got.payload;
-      checkpoint(`poll ${i + 1} after getReport status=${pollMeta.processingStatus}`);
-      if (pollMeta.processingStatus === 'DONE') break;
-      if (pollMeta.processingStatus === 'CANCELLED' || pollMeta.processingStatus === 'FATAL') {
-        throw new Error(`Report ${reportId} ended with status ${pollMeta.processingStatus}`);
-      }
-      await sleep(Math.min(waitMs, maxWaitMs));
-      waitMs = Math.min(waitMs * 1.5, maxWaitMs);
-    }
-    if (!pollMeta || pollMeta.processingStatus !== 'DONE' || !pollMeta.reportDocumentId) {
-      throw new Error(`Report ${reportId} did not complete in time. Status: ${pollMeta?.processingStatus}`);
-    }
-    meta = pollMeta;
-
-    checkpoint('before getReportDocument');
-    const doc = await opts.spClient.request<GetReportDocumentResp>({
-      method: 'GET',
-      path: `/reports/2021-06-30/documents/${meta.reportDocumentId}`,
-    });
-    checkpoint(`after getReportDocument gzip=${doc.payload.compressionAlgorithm ?? 'none'}`);
-
-    checkpoint('before fetch(documentUrl)');
-    const fetched = await fetch(doc.payload.url);
-    checkpoint(`after fetch ok=${fetched.ok} status=${fetched.status}`);
-    if (!fetched.ok || !fetched.body) {
-      throw new Error(`Report document fetch failed (${fetched.status})`);
-    }
-
-    checkpoint('before stream-to-disk');
-    const nodeStream = Readable.fromWeb(fetched.body as unknown as Parameters<typeof Readable.fromWeb>[0]);
-    if (doc.payload.compressionAlgorithm === 'GZIP') {
-      await streamPipeline(nodeStream, createGunzip(), createWriteStream(tmpPath));
-    } else {
-      await streamPipeline(nodeStream, createWriteStream(tmpPath));
-    }
-    bytesWritten = statSync(tmpPath).size;
-    checkpoint(`after stream-to-disk bytes=${bytesWritten}`);
+    }, tmpPath);
+    meta = downloadResult.meta;
+    bytesWritten = downloadResult.bytesWritten;
 
     // 1. Land metadata in raw.sp_api_report — payload as an empty stub
     //    since the real document is on disk and could be hundreds of MB.
@@ -315,21 +230,17 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
       batch.length = 0;
     };
 
-    checkpoint('before stream-parse');
     const pipeline = createReadStream(tmpPath)
       .pipe(parserStream())
       .pipe(pick.asStream({ filter: 'dataByAsin' }))
       .pipe(streamArray.asStream());
 
-    let rowsSeen = 0;
     for await (const chunk of pipeline as AsyncIterable<{ value: SearchQueryAsinRow }>) {
       const r = chunk.value;
       const asin = r.asin;
       const sqd = r.searchQueryData ?? {};
       const query = sqd.searchQuery;
       if (!asin || !query) continue;
-      rowsSeen++;
-      if (rowsSeen % 1000 === 0) checkpoint(`stream-parse @ row ${rowsSeen}`);
 
       batch.push({
         startStr: r.startDate ?? opts.periodStart.toISOString().slice(0, 10),
@@ -350,7 +261,6 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
       if (batch.length >= BATCH_SIZE) await flush();
     }
     await flush();
-    checkpoint(`after stream-parse rowsSeen=${rowsSeen} rowsUpserted=${rowsUpserted}`);
 
     await opts.pg.query(
       'UPDATE raw.sp_api_report SET parsed_at = NOW() WHERE raw_id = $1',
