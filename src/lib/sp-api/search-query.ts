@@ -392,11 +392,26 @@ export function listPeriods(periodType: SqpPeriodType, fromDate: Date, toDate: D
   const align = periodType === 'WEEK' ? weekPeriod
               : periodType === 'MONTH' ? monthPeriod
               : quarterPeriod;
+  // Step to start-of-next-period directly from cursor.start. The previous
+  // approach (cursor.end.getTime() + 1) was fragile: monthPeriod /
+  // quarterPeriod return end at 23:59:59.000 (second precision), so +1ms
+  // lands at 23:59:59.001 which is STILL in the same period, and the loop
+  // never advances. That's the infinite loop responsible for the ~40s OOMs
+  // seen on every SQP backfill attempt — heap fills with re-pushed period
+  // objects until V8 gives up at 4GB.
   const periods: Array<{ start: Date; end: Date }> = [];
   let cursor = align(fromDate);
   while (cursor.start <= toDate) {
     periods.push(cursor);
-    const nextStart = new Date(cursor.end.getTime() + 1);
+    const s = cursor.start;
+    let nextStart: Date;
+    if (periodType === 'WEEK') {
+      nextStart = new Date(s.getTime() + 7 * 86_400_000);
+    } else if (periodType === 'MONTH') {
+      nextStart = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth() + 1, 1));
+    } else {
+      nextStart = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth() + 3, 1));
+    }
     cursor = align(nextStart);
   }
   return periods;
