@@ -4,6 +4,62 @@ import { Readable } from 'node:stream';
 import { SpApiClient } from './client.js';
 
 /**
+ * Result row from GET /reports/2021-06-30/reports — used by callers that
+ * need to enumerate pre-existing reports (e.g. settlement reports, which
+ * Amazon auto-generates on a ~14-day schedule and cannot be requested).
+ */
+export interface ListedReport {
+  reportId: string;
+  reportType: string;
+  dataStartTime?: string;
+  dataEndTime?: string;
+  marketplaceIds?: string[];
+  reportDocumentId?: string;
+  processingStatus: 'IN_QUEUE' | 'IN_PROGRESS' | 'DONE' | 'CANCELLED' | 'FATAL';
+  processingStartTime?: string;
+  processingEndTime?: string;
+  createdTime?: string;
+}
+
+/**
+ * GET /reports/2021-06-30/reports — list reports that exist on Amazon's side.
+ * Paginated via NextToken. Use this for report types Amazon auto-generates
+ * (settlements) rather than createReport-style requests.
+ *
+ * Filters: pass a single reportType to narrow. createdSince / createdUntil
+ * cap the window (the API defaults to last 90 days if unspecified).
+ */
+export async function* listReports(
+  client: SpApiClient,
+  opts: {
+    reportTypes?: string[];
+    processingStatuses?: Array<'IN_QUEUE' | 'IN_PROGRESS' | 'DONE' | 'CANCELLED' | 'FATAL'>;
+    createdSince?: Date;
+    createdUntil?: Date;
+    pageSize?: number;
+  },
+): AsyncGenerator<ListedReport, void, void> {
+  let nextToken: string | undefined;
+  const baseQuery: Record<string, string> = {};
+  if (opts.reportTypes?.length)        baseQuery.reportTypes        = opts.reportTypes.join(',');
+  if (opts.processingStatuses?.length) baseQuery.processingStatuses = opts.processingStatuses.join(',');
+  if (opts.createdSince)               baseQuery.createdSince       = opts.createdSince.toISOString();
+  if (opts.createdUntil)               baseQuery.createdUntil       = opts.createdUntil.toISOString();
+  baseQuery.pageSize = String(opts.pageSize ?? 100);
+
+  do {
+    const query = nextToken ? { ...baseQuery, nextToken } : baseQuery;
+    const res = await client.request<{ reports?: ListedReport[]; nextToken?: string }>({
+      method: 'GET',
+      path: '/reports/2021-06-30/reports',
+      query,
+    });
+    for (const r of res.payload.reports ?? []) yield r;
+    nextToken = res.payload.nextToken;
+  } while (nextToken);
+}
+
+/**
  * Thrown when Amazon ends a report with processingStatus=CANCELLED. This is
  * a distinct condition from FATAL (which is "your request is malformed") —
  * CANCELLED typically means "no data available for this window" (e.g. a date
