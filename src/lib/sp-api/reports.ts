@@ -277,6 +277,94 @@ export async function streamReport(client: SpApiClient, opts: RunReportOpts): Pr
 }
 
 /**
+ * List existing reports of given type(s), without submitting a new one.
+ *
+ * Use for reports that Amazon AUTO-GENERATES on a schedule (settlements,
+ * tax). We don't call createReport — we just discover what Amazon's
+ * already produced and download each by document ID.
+ *
+ * Pagination via `nextToken`; this helper paginates until exhausted.
+ *
+ * Reference: GET /reports/2021-06-30/reports
+ */
+export interface ListReportsOpts {
+  reportTypes: string[];
+  marketplaceIds?: string[];
+  /** Filter by Amazon's data window. `dataStartTime` is the report's
+   *  `dataStartTime`, not when Amazon created the report. */
+  createdSince?: Date;
+  createdUntil?: Date;
+  processingStatuses?: Array<'IN_QUEUE' | 'IN_PROGRESS' | 'DONE' | 'CANCELLED' | 'FATAL'>;
+  pageSize?: number;
+}
+
+export interface ListedReport {
+  reportId: string;
+  reportType: string;
+  reportDocumentId?: string;
+  marketplaceIds?: string[];
+  processingStatus: 'IN_QUEUE' | 'IN_PROGRESS' | 'DONE' | 'CANCELLED' | 'FATAL';
+  dataStartTime?: string;
+  dataEndTime?: string;
+  createdTime?: string;
+  processingStartTime?: string;
+  processingEndTime?: string;
+}
+
+export async function listReports(client: SpApiClient, opts: ListReportsOpts): Promise<ListedReport[]> {
+  const query: Record<string, string> = {
+    reportTypes: opts.reportTypes.join(','),
+    pageSize: String(opts.pageSize ?? 100),
+  };
+  if (opts.marketplaceIds && opts.marketplaceIds.length > 0) {
+    query.marketplaceIds = opts.marketplaceIds.join(',');
+  }
+  if (opts.createdSince) query.createdSince = opts.createdSince.toISOString();
+  if (opts.createdUntil) query.createdUntil = opts.createdUntil.toISOString();
+  if (opts.processingStatuses && opts.processingStatuses.length > 0) {
+    query.processingStatuses = opts.processingStatuses.join(',');
+  }
+
+  const all: ListedReport[] = [];
+  let nextToken: string | undefined = undefined;
+  for (let page = 0; page < 50; page++) {
+    const q: Record<string, string> = { ...query };
+    if (nextToken) {
+      // Per Amazon docs: only nextToken may be sent on follow-up calls.
+      Object.keys(q).forEach((k) => delete q[k]);
+      q.nextToken = nextToken;
+    }
+    const qs = new URLSearchParams(q).toString();
+    const got = await client.request<{ reports: ListedReport[]; nextToken?: string }>({
+      method: 'GET',
+      path: `/reports/2021-06-30/reports?${qs}`,
+    });
+    all.push(...(got.payload.reports ?? []));
+    nextToken = got.payload.nextToken;
+    if (!nextToken) break;
+  }
+  return all;
+}
+
+/**
+ * Fetch a single report document by documentId, decompress if gzipped, and
+ * return the raw text. Use after `listReports` to read an auto-generated
+ * report.
+ */
+export async function fetchReportDocument(client: SpApiClient, reportDocumentId: string): Promise<string> {
+  const doc = await client.request<GetReportDocumentResp>({
+    method: 'GET',
+    path: `/reports/2021-06-30/documents/${reportDocumentId}`,
+  });
+  const fetched = await fetch(doc.payload.url);
+  if (!fetched.ok) {
+    throw new Error(`Report document fetch failed (${fetched.status}): ${await fetched.text()}`);
+  }
+  const buf = Buffer.from(await fetched.arrayBuffer());
+  return doc.payload.compressionAlgorithm === 'GZIP' ? gunzipSync(buf).toString('utf8') : buf.toString('utf8');
+}
+
+/**
  * Parse a TSV report (Amazon's default for most flat-file reports) into an
  * array of objects keyed by header column name. Trims, handles \r\n.
  */

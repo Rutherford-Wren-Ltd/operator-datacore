@@ -315,6 +315,13 @@ jobs:
           npm run ingest-settlements
 
       - name: Pull Settlements (NA)
+        # Run NA settlements even if EU settlements failed — the two regions
+        # share nothing operationally, so EU's failure shouldn't block NA's
+        # cash-position data. Other phase7 steps don't need this since orders
+        # / finances rarely fail; settlements occasionally hit per-marketplace
+        # transient issues (auth, report queue) where a retry on next sync
+        # is the right response.
+        if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
