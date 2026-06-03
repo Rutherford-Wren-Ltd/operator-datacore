@@ -137,6 +137,18 @@ interface FinancialEventsPayload {
   NextToken?: string;
 }
 
+/**
+ * Amazon's Finances v0 API wraps every response body in a `payload` envelope:
+ *   { payload: { FinancialEvents: {...}, NextToken?: string } }
+ *
+ * This differs from the Reports v2021-06-30 API (root-level body shape) — the
+ * Finances v0 envelope is a v0-era SP-API quirk we have to unwrap explicitly.
+ * SpApiClient returns the parsed JSON verbatim; the unwrap happens here.
+ */
+interface FinancialEventsEnvelope {
+  payload?: FinancialEventsPayload;
+}
+
 // ---------------------------------------------------------------------------
 // Normalised row that lands in brain.financial_events.
 // ---------------------------------------------------------------------------
@@ -185,13 +197,18 @@ export async function* listFinancialEvents(
 
   do {
     const query = nextToken ? { ...baseQuery, NextToken: nextToken } : baseQuery;
-    const res = await client.request<FinancialEventsPayload>({
+    const res = await client.request<FinancialEventsEnvelope>({
       method: 'GET',
       path: '/finances/v0/financialEvents',
       query,
     });
-    yield { payload: res.payload, nextToken: res.payload.NextToken };
-    nextToken = res.payload.NextToken;
+    // Unwrap the v0-era `payload` envelope. Fall back to the root in case
+    // Amazon ever stops wrapping (defensive — would only matter on a future
+    // API revision).
+    const inner: FinancialEventsPayload =
+      res.payload.payload ?? (res.payload as unknown as FinancialEventsPayload);
+    yield { payload: inner, nextToken: inner.NextToken };
+    nextToken = inner.NextToken;
   } while (nextToken);
 }
 
