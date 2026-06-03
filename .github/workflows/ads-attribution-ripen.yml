@@ -1,7 +1,7 @@
 name: Ads Attribution Ripen
 
-# Re-pulls the last N days of Amazon Ads SP + SD data for both EU and NA
-# regions on a weekly schedule. Why:
+# Re-pulls the last N days of Amazon Ads SP + SD + SB data for both EU and
+# NA regions on a weekly schedule. Why:
 #
 # Amazon attributes downstream conversions (clicks → purchases) for up to
 # 30 days post-click. The daily-sync workflow pulls each day's Ads data
@@ -72,8 +72,16 @@ jobs:
           ADS_API_ENDPOINT: ${{ secrets.ADS_API_ENDPOINT }}
         run: |
           DAYS="${{ github.event.inputs.days || '7' }}"
-          echo "Re-pulling last ${DAYS} days of EU Ads data (SP + SD)"
-          npm run ads-ingest -- --days "$DAYS"
+          echo "Re-pulling last ${DAYS} days of EU Ads data (SP + SD + SB)"
+          # SB added 2026-06-03 (PRs #67 + #68). At default --concurrency 1,
+          # each (profile, date) fires SP + SD + sbPurchasedProduct +
+          # sbCampaigns = 4 concurrent reports — same total as the old
+          # SP+SD-only setup at --concurrency 2, so we're inside the same
+          # per-app ceiling. SB is in attribution-ripen rather than
+          # daily-sync because the daily setup uses --concurrency 2 (2
+          # profiles × 2 products = 4 concurrent); adding SB there would
+          # push it to 8 and trip the ceiling.
+          npm run ads-ingest -- --products SP,SD,SB --days "$DAYS"
 
   ripen-na:
     name: Ripen NA Ads (last N days)
@@ -99,5 +107,6 @@ jobs:
           ADS_API_NA_PROFILE_ID: ${{ secrets.ADS_API_NA_PROFILE_ID }}
         run: |
           DAYS="${{ github.event.inputs.days || '7' }}"
-          echo "Re-pulling last ${DAYS} days of NA Ads data (SP + SD)"
-          npm run ads-ingest -- --region NA --days "$DAYS"
+          echo "Re-pulling last ${DAYS} days of NA Ads data (SP + SD + SB)"
+          # SB added 2026-06-03 (PRs #67 + #68). Same logic as EU above.
+          npm run ads-ingest -- --region NA --products SP,SD,SB --days "$DAYS"
