@@ -101,10 +101,11 @@ SELECT
          THEN CURRENT_DATE - lp.last_settlement_date
          ELSE NULL END                                                  AS days_since_last_settlement,
 
-    -- Earned but not yet settled — total (back-compat) + decomposed
+    -- Earned but not yet settled — TOTAL (back-compat column at original position).
+    -- Decomposed sub-columns appended at the end of the SELECT (positions 13-14)
+    -- because Postgres CREATE OR REPLACE VIEW forbids inserting new columns
+    -- in the middle of an existing view's column list.
     COALESCE(eu.earned_unsettled, 0)                                    AS earned_unsettled,
-    COALESCE(eu.earned_unsettled_from_sales, 0)                         AS earned_unsettled_from_sales,
-    COALESCE(eu.earned_unsettled_from_fees, 0)                          AS earned_unsettled_from_fees,
     COALESCE(eu.unsettled_event_count, 0)                               AS unsettled_event_count,
     eu.oldest_unsettled_date,
 
@@ -118,7 +119,11 @@ SELECT
             (SELECT MAX(ingested_at) FROM brain.settlements),
             (SELECT MAX(ingested_at) FROM brain.financial_events)
         )
-    )) / 3600.0                                                         AS lake_age_hours
+    )) / 3600.0                                                         AS lake_age_hours,
+
+    -- Decomposed earned_unsettled — appended (see comment above).
+    COALESCE(eu.earned_unsettled_from_sales, 0)                         AS earned_unsettled_from_sales,
+    COALESCE(eu.earned_unsettled_from_fees, 0)                          AS earned_unsettled_from_fees
 
 FROM upcoming up
 FULL OUTER JOIN last_paid        lp USING (marketplace_id, currency_code)
