@@ -64,9 +64,16 @@ async function main(): Promise<void> {
   }
   const regionConfig = getSpApiRegionConfig(region, env);
 
-  // Default --since: 180 days back from "now".
+  // Default --since: 89 days back from "now". Amazon's listReports for
+  // GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2 hard-caps `createdSince` at
+  // 90 days; the call 400s with `InvalidInput` if older. 89 leaves a
+  // 1-day safety margin against any clock skew between us and Amazon.
+  // For a deeper one-off backfill, callers can pass `--since YYYY-MM-DD`
+  // — but Amazon will still refuse anything older than 90 days, so the
+  // backfill window is bounded by the API regardless of what we pass.
+  const DEFAULT_DAYS_BACK = 89;
   const effectiveSince = sinceDate
-    ?? new Date(Date.now() - (days ?? 180) * 86_400_000);
+    ?? new Date(Date.now() - (days ?? DEFAULT_DAYS_BACK) * 86_400_000);
 
   // Marketplace filter: if user provides --marketplace-id, use just that;
   // otherwise let the call return all marketplaces accessible to the LWA app
