@@ -311,8 +311,11 @@ jobs:
           # marketplace, so daily runs are cheap — most days just fire a
           # quick listReports call that returns nothing new. Settlement-level
           # idempotency via raw.sp_api_report.parsed_at; line-level via
-          # deterministic line_hash. Default --since is 180 days back.
-          npm run ingest-settlements
+          # deterministic line_hash. Window is 30 days back: Amazon's
+          # listReports caps `createdSince` at 90 days (older = 400) and
+          # 30 covers the last ~2 settlement cycles per marketplace with a
+          # wide safety margin against missed days.
+          npm run ingest-settlements -- --days 30
 
       - name: Pull Settlements (NA)
         # Run NA settlements even if EU settlements failed — the two regions
@@ -330,4 +333,4 @@ jobs:
           SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
           SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
           SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
-        run: npm run ingest-settlements -- --region na
+        run: npm run ingest-settlements -- --region na --days 30
