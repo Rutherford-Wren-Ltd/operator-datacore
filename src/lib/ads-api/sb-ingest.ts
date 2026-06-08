@@ -54,18 +54,18 @@ import {
 // sbPurchasedProduct — per-purchased-ASIN attributed sales / units.
 // ---------------------------------------------------------------------------
 
-// Note 2026-06-08: Amazon renamed SB report columns `sales14d` → `sales`
-// and `unitsSold14d` → `unitsSold` (breaking change observed in the Sat Jun 7
-// ripen run). The 14-day attribution window is still the SB default — only
-// the field names dropped the `14d` suffix. DB columns `sales_14d` /
-// `units_sold_14d` keep the same name + semantic.
+// sbPurchasedProduct retained the `14d` suffix on its metric columns —
+// only sbCampaigns dropped it (see note above SB_CAMPAIGNS_COLUMNS).
+// PR #88 incorrectly renamed both report types; this stanza was reverted
+// in PR #89 after sbPurchasedProduct started 400'ing with the opposite
+// error: "configuration columns includes invalid values: (sales, unitsSold)".
 const SB_PURCHASED_PRODUCT_COLUMNS = [
   'date',
   'campaignId',
   'adGroupId',
   'purchasedAsin',
-  'sales',
-  'unitsSold',
+  'sales14d',
+  'unitsSold14d',
 ] as const;
 
 interface SbPurchasedProductRow {
@@ -73,15 +73,21 @@ interface SbPurchasedProductRow {
   campaignId: string | number;
   adGroupId?: string | number;
   purchasedAsin?: string;
-  sales?: number;
-  unitsSold?: number;
+  sales14d?: number;
+  unitsSold14d?: number;
 }
 
 // ---------------------------------------------------------------------------
 // sbCampaigns — campaign-level impressions / clicks / cost / sales.
 // ---------------------------------------------------------------------------
 
-// Same rename as SB_PURCHASED_PRODUCT_COLUMNS above (2026-06-08).
+// Note 2026-06-08: Amazon renamed sbCampaigns metric columns `sales14d` → `sales`
+// and `unitsSold14d` → `unitsSold` (breaking change observed in the Sat Jun 7
+// ripen run, fixed in PR #88). The 14-day attribution window is still the SB
+// default — only the API field names dropped the `14d` suffix. DB columns
+// `sales_14d` / `units_sold_14d` keep the same name + semantic. The same
+// rename does NOT apply to sbPurchasedProduct (see stanza above) — these are
+// two distinct Ads-API report types with independent schemas.
 const SB_CAMPAIGNS_COLUMNS = [
   'date',
   'campaignId',
@@ -223,8 +229,8 @@ async function ingestSbPurchasedProduct(opts: IngestSbOptions): Promise<SubResul
         adGroupId,
         entityKey,
         asin,
-        r.sales ?? 0,
-        r.unitsSold ?? 0,
+        r.sales14d ?? 0,
+        r.unitsSold14d ?? 0,
         opts.currencyCode,
       ],
     );
