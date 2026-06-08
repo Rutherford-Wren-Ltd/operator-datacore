@@ -54,13 +54,18 @@ import {
 // sbPurchasedProduct — per-purchased-ASIN attributed sales / units.
 // ---------------------------------------------------------------------------
 
+// Note 2026-06-08: Amazon renamed SB report columns `sales14d` → `sales`
+// and `unitsSold14d` → `unitsSold` (breaking change observed in the Sat Jun 7
+// ripen run). The 14-day attribution window is still the SB default — only
+// the field names dropped the `14d` suffix. DB columns `sales_14d` /
+// `units_sold_14d` keep the same name + semantic.
 const SB_PURCHASED_PRODUCT_COLUMNS = [
   'date',
   'campaignId',
   'adGroupId',
   'purchasedAsin',
-  'sales14d',
-  'unitsSold14d',
+  'sales',
+  'unitsSold',
 ] as const;
 
 interface SbPurchasedProductRow {
@@ -68,22 +73,23 @@ interface SbPurchasedProductRow {
   campaignId: string | number;
   adGroupId?: string | number;
   purchasedAsin?: string;
-  sales14d?: number;
-  unitsSold14d?: number;
+  sales?: number;
+  unitsSold?: number;
 }
 
 // ---------------------------------------------------------------------------
 // sbCampaigns — campaign-level impressions / clicks / cost / sales.
 // ---------------------------------------------------------------------------
 
+// Same rename as SB_PURCHASED_PRODUCT_COLUMNS above (2026-06-08).
 const SB_CAMPAIGNS_COLUMNS = [
   'date',
   'campaignId',
   'impressions',
   'clicks',
   'cost',
-  'sales14d',
-  'unitsSold14d',
+  'sales',
+  'unitsSold',
 ] as const;
 
 interface SbCampaignsRow {
@@ -92,8 +98,8 @@ interface SbCampaignsRow {
   impressions?: number;
   clicks?: number;
   cost?: number;
-  sales14d?: number;
-  unitsSold14d?: number;
+  sales?: number;
+  unitsSold?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,8 +223,8 @@ async function ingestSbPurchasedProduct(opts: IngestSbOptions): Promise<SubResul
         adGroupId,
         entityKey,
         asin,
-        r.sales14d ?? 0,
-        r.unitsSold14d ?? 0,
+        r.sales ?? 0,
+        r.unitsSold ?? 0,
         opts.currencyCode,
       ],
     );
@@ -294,8 +300,8 @@ async function ingestSbCampaigns(opts: IngestSbOptions): Promise<SubResult> {
         r.impressions ?? 0,
         r.clicks ?? 0,
         r.cost ?? 0,
-        r.sales14d ?? 0,
-        r.unitsSold14d ?? 0,
+        r.sales ?? 0,
+        r.unitsSold ?? 0,
         opts.currencyCode,
       ],
     );
