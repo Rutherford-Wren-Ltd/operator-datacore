@@ -130,6 +130,20 @@ jobs:
             });
           "
 
+      - name: Sync FX rates (GBP/EUR → reporting currency)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          REPORTING_CURRENCY: ${{ secrets.REPORTING_CURRENCY }}
+        run: |
+          # Cheap, no SP-API quota — pulls ECB daily rates (frankfurter.app) for
+          # every non-reporting currency in use into meta.fx_rates so
+          # analytics.product_profitability_30d can produce reporting-currency
+          # (cm3_rc) columns. Idempotent; backfills any missing recent dates.
+          npm run sync-fx-rates
+
       - name: Pull FBA inventory snapshot (primary region — EU)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -334,3 +348,30 @@ jobs:
           SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
           SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
         run: npm run ingest-settlements -- --region na --days 30
+
+      - name: Pull FBA storage fees (EU + NA, early/mid month)
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+          SP_API_REGION: ${{ secrets.SP_API_REGION }}
+          SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+          SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
+        run: |
+          # Storage charges are MONTHLY and post in the first week of the
+          # following month; aged/LTSF land mid-month. So we only pull on
+          # days 1-7 (previous month's storage) and 15-18 (LTSF settle).
+          # Idempotent table upsert means re-runs in-window are safe. %-d
+          # strips the leading zero so day 08/09 don't trip bash octal arith.
+          DOM=$(date -u +%-d)
+          if [ "$DOM" -gt 7 ] && { [ "$DOM" -lt 15 ] || [ "$DOM" -gt 18 ]; }; then
+            echo "Day-of-month $DOM outside storage-fee window (1-7, 15-18); skipping."
+            exit 0
+          fi
+          npm run ingest-storage-fees
