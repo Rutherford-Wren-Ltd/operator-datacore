@@ -47,20 +47,23 @@ async function main(): Promise<void> {
 
   const pg = await getPgClient();
   try {
-    // Currencies to convert: every native currency of a marketplace this lake
-    // actually has data for, minus the reporting currency itself.
-    const { rows: ccyRows } = await pg.query<{ native_currency: string }>(
-      `SELECT DISTINCT m.native_currency
-         FROM meta.marketplace m
-        WHERE m.marketplace_id IN (
-              SELECT DISTINCT marketplace_id FROM brain.financial_events
-              UNION
-              SELECT DISTINCT marketplace_id FROM brain.sales_traffic_daily
-        )
-          AND m.native_currency <> $1`,
+    // Currencies to convert: every currency that actually appears as a cost or
+    // revenue currency anywhere in the lake (NOT just marketplace native — the
+    // NA marketplace settles remote-fulfilment orders in USD/CAD/GBP), minus
+    // the reporting currency itself.
+    const { rows: ccyRows } = await pg.query<{ ccy: string }>(
+      `SELECT DISTINCT ccy FROM (
+          SELECT currency_code AS ccy FROM brain.financial_events WHERE currency_code IS NOT NULL
+          UNION SELECT currency_code FROM brain.ads_sp_daily WHERE currency_code IS NOT NULL
+          UNION SELECT currency_code FROM brain.ads_sd_daily WHERE currency_code IS NOT NULL
+          UNION SELECT currency_code FROM brain.fba_storage_fees WHERE currency_code IS NOT NULL
+          UNION SELECT native_currency FROM meta.marketplace m
+                 WHERE m.marketplace_id IN (SELECT DISTINCT marketplace_id FROM brain.sales_traffic_daily)
+       ) s
+       WHERE TRIM(ccy) <> $1 AND TRIM(ccy) <> ''`,
       [reporting],
     );
-    const bases = ccyRows.map((r) => r.native_currency);
+    const bases = ccyRows.map((r) => r.ccy.trim()).filter((c) => /^[A-Z]{3}$/.test(c));
     if (bases.length === 0) {
       console.log(`No non-${reporting} currencies in use. Nothing to fetch.`);
       return;
