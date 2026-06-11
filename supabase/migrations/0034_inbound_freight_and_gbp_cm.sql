@@ -226,6 +226,9 @@ final AS (
             ELSE NULL
         END AS inbound_per_unit,
         CASE
+            -- US with a known case qty but no UPS-computed box cost (carton dims
+            -- incomplete) is still using the flat placeholder, not a real rate.
+            WHEN units_per_case > 0 AND marketplace_id = 'ATVPDKIKX0DER' AND us_inbound_box_cost_gbp IS NULL THEN 'us_box_estimate'
             WHEN units_per_case > 0 THEN 'case_qty'
             WHEN unit_vol_m3 > 0 THEN 'volumetric_fallback'
             ELSE 'missing'
@@ -269,9 +272,14 @@ SELECT
     (CASE WHEN cogs_landed IS NULL THEN 'cogs:missing' ELSE 'cogs:ok' END)
       || ';inbound:' || inbound_source
       || ';storage:' || COALESCE(storage_source,'missing')
+      || ';coverage:' || CASE WHEN units_ordered_st > 0 AND units_settled < 0.7 * units_ordered_st THEN 'partial' ELSE 'ok' END
       || ';fx:' || CASE WHEN any_unconverted THEN 'partial' ELSE 'ok' END AS cost_completeness,
     CASE
         WHEN cogs_landed IS NULL OR COALESCE(storage_source,'missing')='missing' OR inbound_source='missing' OR any_unconverted THEN 'low'
+        -- Settled-coverage guard: when far fewer units settled than were ORDERED
+        -- (sales_traffic), the financial_events window is incomplete, so revenue is
+        -- understated and every ratio (esp ads %) is distorted -> not trustworthy.
+        WHEN units_ordered_st > 0 AND units_settled < 0.7 * units_ordered_st THEN 'low'
         WHEN inbound_source='case_qty' AND storage_source='per_fnsku' THEN 'high'
         ELSE 'medium'
     END AS confidence,
