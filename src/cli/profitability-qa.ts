@@ -67,6 +67,9 @@ async function main(): Promise<void> {
     const thin = rows.filter((r) => { const m = n(r.cm3_margin_pct); return m !== null && m >= 0 && m < marginWarn; });
     const lowConf = rows.filter((r) => r.confidence === 'low');
     const variance = rows.filter((r) => n(r.variance_pct) !== null && Math.abs(n(r.variance_pct)!) > varianceTol);
+    // US SKUs costed on the DEFAULT duty rate (no HS code) — the HS-code fill worklist.
+    const dutyDefault = rows.filter((r) => (r.cost_completeness ?? '').includes('duty:default'))
+      .sort((a, b) => Number(b.revenue_ex_vat ?? 0) - Number(a.revenue_ex_vat ?? 0));
 
     const fmtRow = (r: Row) =>
       `  ${(r.country_code ?? '??')} ${r.asin}  CM3 ${r.cm3_margin_pct ?? '—'}%  ` +
@@ -88,6 +91,9 @@ async function main(): Promise<void> {
     log('');
     log(`WARN — low confidence (incomplete cost data): ${lowConf.length}`);
     lowConf.slice(0, 20).forEach((r) => log(fmtRow(r)));
+    log('');
+    log(`INFO — US SKUs on the default duty rate (add HS code to sku-hs-codes.csv): ${dutyDefault.length}`);
+    dutyDefault.slice(0, 20).forEach((r) => log(fmtRow(r)));
     log('');
     log(`INFO — reconciliation variance > ${varianceTol}pp (coarse; financial_events history is shallower than the 90d settlement window, so expect noise): ${variance.length}`);
     variance.slice(0, 20).forEach((r) => log(fmtRow(r)));

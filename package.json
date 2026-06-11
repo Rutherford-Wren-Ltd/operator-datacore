@@ -53,6 +53,8 @@
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "import-masters": "tsx src/cli/import-masters.ts",
     "import-packaging": "tsx src/cli/import-packaging.ts",
+    "import-hs-codes": "tsx src/cli/import-hs-codes.ts",
+    "import-duty-rates": "tsx src/cli/import-duty-rates.ts",
     "compute-us-inbound": "tsx src/cli/compute-us-inbound.ts",
     "profitability-qa": "tsx src/cli/profitability-qa.ts",
     "import-fba-fees": "tsx src/cli/import-fba-fees.ts",

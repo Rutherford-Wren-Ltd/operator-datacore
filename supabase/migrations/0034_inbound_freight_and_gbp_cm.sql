@@ -70,6 +70,35 @@ ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_billed_weight_k
 -- 'volumetric_item' (weight+volume-limited max-box fit). Priced via UPS.
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_per_unit_gbp     NUMERIC(12,4);
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_method           TEXT;
+-- HS / commodity codes for duty resolution (import-hs-codes CLI).
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS hs_code_us                  TEXT;
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS hs_code_uk                  TEXT;
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS hs_code_source              TEXT;
+
+-- ----------------------------------------------------------------------------
+-- brain.us_import_duty_rate — HS-code -> US import duty (base + Section 301 +
+-- reciprocal). total_pct is authoritative. The '*' row is the catch-all default
+-- applied when a SKU has no HS match. Operator-maintained (import-duty-rates).
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS brain.us_import_duty_rate (
+    hs_code           TEXT          NOT NULL,   -- HS/HTS prefix; '*' = default
+    base_pct          NUMERIC(6,4),
+    section_301_pct   NUMERIC(6,4),
+    reciprocal_pct    NUMERIC(6,4),
+    total_pct         NUMERIC(6,4)  NOT NULL,
+    effective_from    DATE          NOT NULL DEFAULT '2025-01-01',
+    notes             TEXT,
+    updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (hs_code, effective_from)
+);
+INSERT INTO brain.us_import_duty_rate (hs_code, total_pct, effective_from, notes) VALUES
+    ('*',       0.6020, '2025-01-01', 'Default fallback US duty (China-origin); edit to your blended rate'),
+    ('7323.94', 0.6020, '2025-01-01', 'Steel kitchenware/bakeware China — base+301+reciprocal (from PO costings)')
+ON CONFLICT (hs_code, effective_from) DO UPDATE
+    SET total_pct = EXCLUDED.total_pct, notes = EXCLUDED.notes, updated_at = NOW();
+
+COMMENT ON TABLE brain.us_import_duty_rate IS
+'HS-code -> US import duty %. Longest-prefix match (10-digit -> chapter); hs_code=''*'' is the default fallback. total_pct authoritative; base/301/reciprocal for transparency + what-if.';
 
 COMMENT ON COLUMN brain.sku_master.units_per_case IS
 'Units per master carton, from sku-packaging.csv (authoritative; NOT derived). NULL = SKU has no clean master carton (reworked at inbound) -> volumetric fallback.';
@@ -101,6 +130,34 @@ COMMENT ON VIEW analytics.product_cost_crosswalk IS
 -- analytics.product_profitability_30d — GBP CM ladder + inbound freight.
 -- DROP+CREATE: column shape changes vs 0033.
 -- ----------------------------------------------------------------------------
+-- ----------------------------------------------------------------------------
+-- analytics.sku_us_duty — per-ASIN US duty rate: longest HS-prefix match
+-- effective today, else the '*' default. duty_source flags hs vs default.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW analytics.sku_us_duty AS
+WITH base AS (
+    SELECT DISTINCT ON (sm.asin) sm.asin, sm.ean, sm.hs_code_us
+    FROM brain.sku_master sm
+    WHERE sm.asin IS NOT NULL
+    ORDER BY sm.asin, (sm.hs_code_us IS NOT NULL) DESC, sm.ean
+)
+SELECT b.asin, b.ean, b.hs_code_us,
+    COALESCE(m.total_pct, dflt.total_pct, 0.60) AS duty_pct,
+    CASE WHEN m.total_pct IS NOT NULL THEN 'hs' ELSE 'default' END AS duty_source
+FROM base b
+LEFT JOIN LATERAL (
+    SELECT r.total_pct FROM brain.us_import_duty_rate r
+    WHERE r.hs_code <> '*' AND b.hs_code_us LIKE r.hs_code || '%' AND r.effective_from <= CURRENT_DATE
+    ORDER BY LENGTH(r.hs_code) DESC, r.effective_from DESC LIMIT 1
+) m ON TRUE
+LEFT JOIN LATERAL (
+    SELECT total_pct FROM brain.us_import_duty_rate WHERE hs_code='*' AND effective_from <= CURRENT_DATE
+    ORDER BY effective_from DESC LIMIT 1
+) dflt ON TRUE;
+
+COMMENT ON VIEW analytics.sku_us_duty IS
+'Per-ASIN US import duty rate. Longest HS-prefix match in brain.us_import_duty_rate effective today; falls back to the ''*'' default row (duty_source=default). Joined into product_profitability_30d as the US import_duty line.';
+
 DROP VIEW IF EXISTS analytics.product_profitability_30d;
 CREATE VIEW analytics.product_profitability_30d AS
 WITH params AS (
@@ -198,6 +255,27 @@ st AS (
     WHERE metric_date >= (SELECT win_start FROM params) AND metric_date < (SELECT win_end FROM params)
     GROUP BY marketplace_id, child_asin
 ),
+-- Duty base: factory-gate FOB (true base), from the latest PO comp_fob (USD->GBP);
+-- fallback to cogs_landed flagged as a proxy (it includes UK freight, so it
+-- knowingly over-states duty — an upper bound, not exact).
+fob AS (
+    SELECT DISTINCT ON (sm.asin) sm.asin,
+        COALESCE(pol.comp_fob * COALESCE(fxf.rate,1), sm.cogs_landed) AS us_fob_gbp,
+        CASE WHEN pol.comp_fob IS NOT NULL THEN 'po_fob' ELSE 'cogs_proxy' END AS fob_source
+    FROM brain.sku_master sm
+    LEFT JOIN brain.purchase_order_lines pol ON pol.ean = sm.ean AND pol.comp_fob IS NOT NULL
+    LEFT JOIN fx_map fxf ON fxf.ccy = TRIM(pol.landed_cost_currency)
+    WHERE sm.asin IS NOT NULL
+    ORDER BY sm.asin, (pol.comp_fob IS NOT NULL) DESC, pol.updated_at DESC NULLS LAST
+),
+-- Route: direct China->US (AWD) vs UK->US re-export. Direct-AWD freight is in the
+-- PO na landing (not yet wired) -> v1 drops the wrong-route UPS inbound for them.
+route AS (
+    SELECT DISTINCT sm.asin, TRUE AS is_direct_awd
+    FROM brain.sku_master sm
+    JOIN brain.purchase_order_lines pol ON pol.ean = sm.ean AND pol.destination = 'usa_awd'
+    WHERE sm.asin IS NOT NULL
+),
 calc AS (
     SELECT
         fe.*, a.brand, a.cogs_landed, a.cogs_currency, a.units_per_case, a.units_per_case_source, a.fnsku_fanout,
@@ -209,6 +287,8 @@ calc AS (
         -- (us_inbound_per_unit_gbp: UPS-priced from carton/item dims).
         (ifr.cost_per_box * COALESCE(bfx.rate,1)) AS box_cost_gbp,
         COALESCE(cfx.rate,1) AS cogs_rate,
+        d.duty_pct, d.duty_source, fb.us_fob_gbp, fb.fob_source,
+        COALESCE(rt.is_direct_awd, FALSE) AS is_direct_awd,
         m.country_code, m.country_name
     FROM fe
     LEFT JOIN attrs a       ON a.marketplace_id=fe.marketplace_id AND a.asin=fe.asin
@@ -217,6 +297,9 @@ calc AS (
     LEFT JOIN storage_latest sl ON sl.marketplace_id=fe.marketplace_id AND sl.asin=fe.asin
     LEFT JOIN st            ON st.marketplace_id=fe.marketplace_id AND st.asin=fe.asin
     LEFT JOIN unitvol uv    ON uv.asin=fe.asin
+    LEFT JOIN analytics.sku_us_duty d ON d.asin=fe.asin
+    LEFT JOIN fob fb        ON fb.asin=fe.asin
+    LEFT JOIN route rt      ON rt.asin=fe.asin
     LEFT JOIN meta.marketplace m ON m.marketplace_id=fe.marketplace_id
     LEFT JOIN brain.inbound_freight_rate ifr ON ifr.marketplace_id=fe.marketplace_id
     LEFT JOIN fx_map bfx ON bfx.ccy=TRIM(ifr.currency_code)
@@ -225,15 +308,20 @@ calc AS (
 final AS (
     SELECT *,
         (units_settled * cogs_landed * cogs_rate) AS cogs_total_calc,
+        -- US import duty = FOB x duty_pct (UK has none). Discrete landed-cost line.
+        CASE WHEN marketplace_id = 'ATVPDKIKX0DER' THEN COALESCE(us_fob_gbp,0) * COALESCE(duty_pct,0) ELSE 0 END AS import_duty_per_unit,
         CASE
-            -- US inbound is the precomputed per-unit (UPS-priced from carton or
-            -- item dims, or a weight+volume max-box fit). UK uses the flat box.
+            -- Direct-AWD US: China->US freight is in the (pending) AWD landing, NOT
+            -- UK->US UPS — drop the wrong-route proxy rather than stack it on duty.
+            WHEN marketplace_id = 'ATVPDKIKX0DER' AND is_direct_awd THEN 0
+            -- US re-export inbound: precomputed per-unit (UPS-priced). UK uses the flat box.
             WHEN marketplace_id = 'ATVPDKIKX0DER' THEN us_inbound_per_unit_gbp
             WHEN units_per_case > 0 THEN box_cost_gbp / units_per_case
             WHEN unit_vol_m3 > 0 AND max_box_volume_m3 > 0 THEN box_cost_gbp / GREATEST(FLOOR(max_box_volume_m3 * 0.75 / unit_vol_m3), 1)
             ELSE NULL
         END AS inbound_per_unit,
         CASE
+            WHEN marketplace_id = 'ATVPDKIKX0DER' AND is_direct_awd THEN 'in_landed'
             WHEN marketplace_id = 'ATVPDKIKX0DER' THEN
                  CASE WHEN us_inbound_method IN ('carton','item_x_case') THEN 'case_qty'
                       WHEN us_inbound_method = 'volumetric_item'         THEN 'volumetric_fallback'
@@ -253,6 +341,9 @@ SELECT
     ROUND(COALESCE(cogs_total_calc,0),2) AS cogs_total,
     ROUND(COALESCE(units_settled * inbound_per_unit,0),2) AS inbound_total,
     inbound_source,
+    ROUND(COALESCE(units_settled * import_duty_per_unit,0),2) AS import_duty,
+    CASE WHEN marketplace_id='ATVPDKIKX0DER' THEN ROUND(COALESCE(duty_pct,0),4) ELSE 0 END AS import_duty_pct,
+    CASE WHEN marketplace_id='ATVPDKIKX0DER' THEN COALESCE(duty_source,'default') ELSE 'na' END AS duty_source,
     ROUND(referral_fees,2) AS referral_fees,
     ROUND(fba_fulfilment,2) AS fba_fulfilment,
     ROUND(closing_fees,2) AS closing_fees,
@@ -263,15 +354,15 @@ SELECT
     ROUND(COALESCE(storage_base,0),2) AS storage_base,
     ROUND(COALESCE(aged_surcharge,0),2) AS aged_surcharge,
     ROUND(COALESCE(nonsellable_units,0)*COALESCE(cogs_landed,0)*cogs_rate,2) AS returns_cogs_clawback,
-    ROUND(revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0),2) AS cm1,
-    ROUND(revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0)
+    ROUND(revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0) - COALESCE(units_settled*import_duty_per_unit,0),2) AS cm1,
+    ROUND(revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0) - COALESCE(units_settled*import_duty_per_unit,0)
           - referral_fees - fba_fulfilment - closing_fees - other_amazon_fees - promo_total,2) AS cm2,
-    ROUND(revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0)
+    ROUND(revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0) - COALESCE(units_settled*import_duty_per_unit,0)
           - referral_fees - fba_fulfilment - closing_fees - other_amazon_fees - promo_total
           - COALESCE(ads_total,0) + refund_net - COALESCE(storage_base,0) - COALESCE(aged_surcharge,0)
           - COALESCE(nonsellable_units,0)*COALESCE(cogs_landed,0)*cogs_rate,2) AS cm3,
     CASE WHEN revenue_ex_vat > 0 THEN ROUND(100.0*(
-          revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0)
+          revenue_ex_vat - COALESCE(cogs_total_calc,0) - COALESCE(units_settled*inbound_per_unit,0) - COALESCE(units_settled*import_duty_per_unit,0)
           - referral_fees - fba_fulfilment - closing_fees - other_amazon_fees - promo_total
           - COALESCE(ads_total,0) + refund_net - COALESCE(storage_base,0) - COALESCE(aged_surcharge,0)
           - COALESCE(nonsellable_units,0)*COALESCE(cogs_landed,0)*cogs_rate
@@ -280,6 +371,8 @@ SELECT
     fnsku_fanout,
     (CASE WHEN cogs_landed IS NULL THEN 'cogs:missing' ELSE 'cogs:ok' END)
       || ';inbound:' || inbound_source
+      || ';duty:' || CASE WHEN marketplace_id='ATVPDKIKX0DER' THEN COALESCE(duty_source,'default') ELSE 'na' END
+      || CASE WHEN marketplace_id='ATVPDKIKX0DER' AND is_direct_awd THEN ';freight:awd_pending' ELSE '' END
       || ';storage:' || COALESCE(storage_source,'missing')
       || ';coverage:' || CASE WHEN units_ordered_st > 0 AND units_settled < 0.7 * units_ordered_st THEN 'partial' ELSE 'ok' END
       || ';fx:' || CASE WHEN any_unconverted THEN 'partial' ELSE 'ok' END AS cost_completeness,
@@ -289,14 +382,34 @@ SELECT
         -- (sales_traffic), the financial_events window is incomplete, so revenue is
         -- understated and every ratio (esp ads %) is distorted -> not trustworthy.
         WHEN units_ordered_st > 0 AND units_settled < 0.7 * units_ordered_st THEN 'low'
-        WHEN inbound_source='case_qty' AND storage_source='per_fnsku' THEN 'high'
+        -- US on the DEFAULT duty rate (no HS code) is an estimate -> never high.
+        WHEN inbound_source='case_qty' AND storage_source='per_fnsku'
+             AND NOT (marketplace_id='ATVPDKIKX0DER' AND COALESCE(duty_source,'default')='default') THEN 'high'
         ELSE 'medium'
     END AS confidence,
     EXTRACT(EPOCH FROM (NOW() - (SELECT MAX(ingested_at) FROM brain.financial_events)))/3600.0 AS lake_age_hours
 FROM final;
 
 COMMENT ON VIEW analytics.product_profitability_30d IS
-'Per-(marketplace, asin) CM1/CM2/CM3 over trailing 30d, all in GBP (every line FX-converted via meta.fx_rates before summing - fixes the NA USD/CAD/GBP mix). CM1 nets landed COGS + inbound freight. inbound_source: case_qty (box cost / units_per_case from sku-packaging.csv) | volumetric_fallback (box cost / units-per-max-Amazon-box, from storage-report unit volume) | missing. confidence high only with case_qty + per_fnsku storage.';
+'Per-(marketplace, asin) CM1/CM2/CM3 over trailing 30d, all in GBP (every line FX-converted via meta.fx_rates before summing - fixes the NA USD/CAD/GBP mix). CM1 nets landed COGS + inbound freight + US import duty. import_duty = FOB x duty_pct (US only, from analytics.sku_us_duty; duty_source hs|default). Direct-AWD US SKUs drop the UK->US UPS inbound (freight:awd_pending). confidence is never high on a default duty rate.';
+
+-- ----------------------------------------------------------------------------
+-- analytics.us_tariff_exposure — per-(asin) US import-duty exposure for managing
+-- tariff risk: monthly duty £, the rate + source, and a +10pp what-if.
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW analytics.us_tariff_exposure AS
+SELECT p.asin, p.brand, p.units_settled, p.revenue_ex_vat,
+    p.import_duty AS import_duty_gbp_30d, p.import_duty_pct, p.duty_source,
+    d.hs_code_us,
+    ROUND(p.import_duty * (p.import_duty_pct + 0.10) / NULLIF(p.import_duty_pct,0), 2) AS import_duty_at_plus_10pp,
+    p.cm3, p.cm3_margin_pct
+FROM analytics.product_profitability_30d p
+LEFT JOIN analytics.sku_us_duty d ON d.asin = p.asin
+WHERE p.marketplace_id = 'ATVPDKIKX0DER' AND p.revenue_ex_vat > 0
+ORDER BY p.import_duty DESC;
+
+COMMENT ON VIEW analytics.us_tariff_exposure IS
+'Per-ASIN US import-duty exposure (trailing 30d): duty £, rate, source (hs|default), HS code, a +10pp what-if, and resulting CM3. For managing tariff risk as US rates move and for prioritising HS-code fill (duty_source=default).';
 
 -- ----------------------------------------------------------------------------
 -- analytics.product_profitability_reconciliation — GBP rework.
