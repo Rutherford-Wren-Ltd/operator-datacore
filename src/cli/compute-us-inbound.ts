@@ -104,28 +104,65 @@ async function main(): Promise<void> {
   console.log('-----------------------------------------------------');
   const rc = loadRateCard(cardPath);
 
+  // Max Amazon box (64x46x46cm / 22kg) + a packing-efficiency factor: a box never
+  // fills to its nominal cuboid volume (void fill, irregular shapes).
+  const MAX_BOX_VOL_M3 = 0.135424, MAX_BOX_WT_KG = 22, PACK = 0.75;
+  const DIV = rc.divisor; // cm^3 per kg (5000)
+  // dimensional weight (kg) of n items of volM3 each: m^3 -> cm^3 (x1e6) / divisor
+  const dimWt = (volM3: number, n: number) => (volM3 * n * 1e6) / DIV;
+
   const pg = await getPgClient();
-  let computed = 0, skipped = 0, flaggedOverweight = 0;
+  const byMethod = { carton: 0, item_x_case: 0, volumetric_item: 0, none: 0 } as Record<'carton'|'item_x_case'|'volumetric_item'|'none', number>;
   try {
-    const { rows } = await pg.query<{ ean: string; l: string | null; w: string | null; h: string | null; wt: string | null }>(
-      `SELECT ean, carton_length_cm AS l, carton_width_cm AS w, carton_height_cm AS h, carton_weight_kg AS wt
-         FROM brain.sku_master`,
+    const { rows } = await pg.query<{
+      ean: string; upc: string | null; cl: string | null; cw: string | null; ch: string | null; cwt: string | null;
+      iwt: string | null; ivol: string | null;
+    }>(
+      `SELECT sm.ean, sm.units_per_case AS upc,
+              sm.carton_length_cm AS cl, sm.carton_width_cm AS cw, sm.carton_height_cm AS ch, sm.carton_weight_kg AS cwt,
+              d.item_weight_kg AS iwt, d.item_volume_m3 AS ivol
+         FROM brain.sku_master sm
+         LEFT JOIN (
+           SELECT asin, AVG(item_weight_kg) AS item_weight_kg, AVG(item_volume_m3) AS item_volume_m3
+           FROM brain.fba_item_dimensions WHERE asin IS NOT NULL AND item_volume_m3 > 0
+           GROUP BY asin
+         ) d ON d.asin = sm.asin`,
     );
     for (const r of rows) {
-      const l = r.l ? Number(r.l) : 0, w = r.w ? Number(r.w) : 0, h = r.h ? Number(r.h) : 0, wt = r.wt ? Number(r.wt) : 0;
-      const dimW = (l > 0 && w > 0 && h > 0) ? (l * w * h) / rc.divisor : 0;
-      const billed = Math.max(wt, dimW);
-      if (billed <= 0) { skipped++; continue; }       // no carton data -> leave null (view falls back)
-      if (billed > 29.5) flaggedOverweight++;          // card's max_pkg_weight flag
-      const cost = rateFor(billed, rc);
-      if (values['dry-run']) { computed++; continue; }
+      const upc = r.upc ? Number(r.upc) : 0;
+      const cl = Number(r.cl) || 0, cw = Number(r.cw) || 0, ch = Number(r.ch) || 0, cwt = Number(r.cwt) || 0;
+      const iwt = Number(r.iwt) || 0, ivol = Number(r.ivol) || 0;
+
+      let method: 'carton' | 'item_x_case' | 'volumetric_item' | null = null;
+      let perUnit = 0, billed = 0;
+      if (upc > 0 && cl > 0 && cw > 0 && ch > 0 && cwt > 0) {
+        // 1. operator carton dims+weight (authoritative)
+        billed = Math.max(cwt, (cl * cw * ch) / DIV);
+        perUnit = rateFor(billed, rc) / upc; method = 'carton';
+      } else if (upc > 0 && iwt > 0 && ivol > 0) {
+        // 2. estimate the carton from item dims x known case qty
+        billed = Math.max(iwt * upc, dimWt(ivol, upc));
+        perUnit = rateFor(billed, rc) / upc; method = 'item_x_case';
+      } else if (iwt > 0 && ivol > 0) {
+        // 3. no case qty: how many fit in the max box, weight- AND volume-limited
+        const unitsFit = Math.max(1, Math.floor(Math.min((MAX_BOX_VOL_M3 * PACK) / ivol, MAX_BOX_WT_KG / iwt)));
+        billed = Math.max(iwt * unitsFit, dimWt(ivol, unitsFit));
+        perUnit = rateFor(billed, rc) / unitsFit; method = 'volumetric_item';
+      }
+      if (!method) { byMethod.none++; continue; }
+      byMethod[method]!++;
+      if (values['dry-run']) continue;
       await pg.query(
-        `UPDATE brain.sku_master SET us_inbound_box_cost_gbp = $2::numeric, us_inbound_billed_weight_kg = $3::numeric, updated_at = NOW() WHERE ean = $1`,
-        [r.ean, cost.toFixed(4), billed.toFixed(3)],
+        `UPDATE brain.sku_master SET us_inbound_per_unit_gbp=$2::numeric, us_inbound_method=$3,
+           us_inbound_billed_weight_kg=$4::numeric, updated_at=NOW() WHERE ean=$1`,
+        [r.ean, perUnit.toFixed(4), method, billed.toFixed(3)],
       );
-      computed++;
     }
-    console.log(`\nUS box cost computed for ${computed} SKU(s); ${skipped} skipped (no carton data); ${flaggedOverweight} over 29.5kg/pkg (check dim audit).`);
+    console.log('\nUS inbound per unit computed by method:');
+    console.log(`  carton (operator dims):     ${byMethod.carton}`);
+    console.log(`  item x case (storage dims): ${byMethod.item_x_case}`);
+    console.log(`  volumetric max-box fit:     ${byMethod.volumetric_item}`);
+    console.log(`  no data (skipped):          ${byMethod.none}`);
   } finally {
     try { await pg.end(); } catch { /* */ }
   }

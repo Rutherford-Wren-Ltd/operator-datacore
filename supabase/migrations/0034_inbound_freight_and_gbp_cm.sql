@@ -65,6 +65,11 @@ ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS carton_weight_kg      NUME
 -- billed weight (max actual vs L*W*H/5000) -> freight band -> MRPP floor. GBP.
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_box_cost_gbp     NUMERIC(12,4);
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_billed_weight_kg NUMERIC(8,3);
+-- Per-unit US inbound cost + the method used (compute-us-inbound): 'carton'
+-- (operator carton dims), 'item_x_case' (storage item dims x known case qty),
+-- 'volumetric_item' (weight+volume-limited max-box fit). Priced via UPS.
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_per_unit_gbp     NUMERIC(12,4);
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_method           TEXT;
 
 COMMENT ON COLUMN brain.sku_master.units_per_case IS
 'Units per master carton, from sku-packaging.csv (authoritative; NOT derived). NULL = SKU has no clean master carton (reworked at inbound) -> volumetric fallback.';
@@ -83,7 +88,8 @@ SELECT
     l.marketplace_id, l.asin, l.fnsku, l.canonical_sku, sku_x.seller_sku,
     l.all_skus, l.sku_count, (l.sku_count > 1) AS fnsku_fanout,
     sm.ean, sm.brand, sm.cogs_landed, sm.cogs_currency, sm.fba_fee,
-    sm.units_per_case, sm.units_per_case_source, sm.us_inbound_box_cost_gbp
+    sm.units_per_case, sm.units_per_case_source, sm.us_inbound_box_cost_gbp,
+    sm.us_inbound_per_unit_gbp, sm.us_inbound_method
 FROM latest l
 CROSS JOIN LATERAL unnest(l.all_skus) AS sku_x(seller_sku)
 LEFT JOIN brain.sku_master sm ON sm.asin = l.asin;
@@ -118,6 +124,8 @@ attrs AS (
            MAX(brand) AS brand, MAX(units_per_case) AS units_per_case,
            MAX(units_per_case_source) AS units_per_case_source,
            MAX(us_inbound_box_cost_gbp) AS us_inbound_box_cost_gbp,
+           MAX(us_inbound_per_unit_gbp) AS us_inbound_per_unit_gbp,
+           MAX(us_inbound_method) AS us_inbound_method,
            bool_or(fnsku_fanout) AS fnsku_fanout
     FROM analytics.product_cost_crosswalk GROUP BY marketplace_id, asin
 ),
@@ -195,14 +203,11 @@ calc AS (
         fe.*, a.brand, a.cogs_landed, a.cogs_currency, a.units_per_case, a.units_per_case_source, a.fnsku_fanout,
         ads.ads_total, ret.nonsellable_units, sl.storage_base, sl.aged_surcharge, sl.storage_source,
         st.units_ordered_st, uv.unit_vol_m3,
-        ifr.cost_per_box, ifr.currency_code AS box_ccy, ifr.max_box_volume_m3,
-        a.us_inbound_box_cost_gbp,
-        -- US box cost is per-SKU from the UPS rate card (us_inbound_box_cost_gbp,
-        -- already GBP); UK is the flat DPD box cost. Fall back to the flat
-        -- inbound_freight_rate cost where the per-SKU US figure is absent.
-        CASE WHEN fe.marketplace_id = 'ATVPDKIKX0DER'
-             THEN COALESCE(a.us_inbound_box_cost_gbp, ifr.cost_per_box * COALESCE(bfx.rate,1))
-             ELSE ifr.cost_per_box * COALESCE(bfx.rate,1) END AS box_cost_gbp,
+        ifr.cost_per_box, ifr.max_box_volume_m3,
+        a.us_inbound_per_unit_gbp, a.us_inbound_method,
+        -- UK = flat DPD box cost; US inbound is the precomputed per-unit
+        -- (us_inbound_per_unit_gbp: UPS-priced from carton/item dims).
+        (ifr.cost_per_box * COALESCE(bfx.rate,1)) AS box_cost_gbp,
         COALESCE(cfx.rate,1) AS cogs_rate,
         m.country_code, m.country_name
     FROM fe
@@ -221,14 +226,18 @@ final AS (
     SELECT *,
         (units_settled * cogs_landed * cogs_rate) AS cogs_total_calc,
         CASE
+            -- US inbound is the precomputed per-unit (UPS-priced from carton or
+            -- item dims, or a weight+volume max-box fit). UK uses the flat box.
+            WHEN marketplace_id = 'ATVPDKIKX0DER' THEN us_inbound_per_unit_gbp
             WHEN units_per_case > 0 THEN box_cost_gbp / units_per_case
-            WHEN unit_vol_m3 > 0 AND max_box_volume_m3 > 0 THEN box_cost_gbp / GREATEST(FLOOR(max_box_volume_m3 / unit_vol_m3), 1)
+            WHEN unit_vol_m3 > 0 AND max_box_volume_m3 > 0 THEN box_cost_gbp / GREATEST(FLOOR(max_box_volume_m3 * 0.75 / unit_vol_m3), 1)
             ELSE NULL
         END AS inbound_per_unit,
         CASE
-            -- US with a known case qty but no UPS-computed box cost (carton dims
-            -- incomplete) is still using the flat placeholder, not a real rate.
-            WHEN units_per_case > 0 AND marketplace_id = 'ATVPDKIKX0DER' AND us_inbound_box_cost_gbp IS NULL THEN 'us_box_estimate'
+            WHEN marketplace_id = 'ATVPDKIKX0DER' THEN
+                 CASE WHEN us_inbound_method IN ('carton','item_x_case') THEN 'case_qty'
+                      WHEN us_inbound_method = 'volumetric_item'         THEN 'volumetric_fallback'
+                      ELSE 'missing' END
             WHEN units_per_case > 0 THEN 'case_qty'
             WHEN unit_vol_m3 > 0 THEN 'volumetric_fallback'
             ELSE 'missing'

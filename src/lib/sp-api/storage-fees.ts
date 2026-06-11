@@ -146,6 +146,64 @@ export function parseStorageFeeReport(rawText: string, marketplaceId: string, fa
   return out;
 }
 
+export interface ItemDimRow {
+  marketplaceId: string;
+  fnsku: string;
+  asin: string | null;
+  productName: string | null;
+  longestSideCm: number | null;
+  medianSideCm: number | null;
+  shortestSideCm: number | null;
+  weightKg: number | null;
+  itemVolumeM3: number | null;
+  sizeTier: string | null;
+  snapshotMonth: string;
+}
+
+/**
+ * Parse per-item PACKAGED dimensions from the storage report (one row per
+ * fnsku). Normalises units: NA reports sides in inches / weight in pounds /
+ * volume in cubic feet; EU in cm / kg / m^3. We convert everything to cm/kg/m^3
+ * using the report's own *_units columns.
+ */
+export function parseItemDimensions(rawText: string, marketplaceId: string, fallbackMonth: Date): ItemDimRow[] {
+  const rows = parseTsv(rawText);
+  if (rows.length === 0) return [];
+  const normMap = new Map<string, string>();
+  for (const key of Object.keys(rows[0]!)) normMap.set(norm(key), key);
+
+  const toCm = (v: number | null, unit: string | undefined) =>
+    v === null ? null : (/(inch|in\b)/i.test(unit ?? '') ? v * 2.54 : v);
+  const toKg = (v: number | null, unit: string | undefined) =>
+    v === null ? null : (/(pound|lb)/i.test(unit ?? '') ? v * 0.453592 : v);
+  const toM3 = (v: number | null, unit: string | undefined) =>
+    v === null ? null : (/(feet|foot|ft|cubic\s*f)/i.test(unit ?? '') ? v * 0.0283168 : v);
+
+  const seen = new Set<string>();
+  const out: ItemDimRow[] = [];
+  for (const row of rows) {
+    const fnsku = pick(row, normMap, ['fnsku']);
+    if (!fnsku || seen.has(fnsku)) continue;
+    seen.add(fnsku);
+    const lenUnit = pick(row, normMap, ['measurement_units', 'dimension_units']);
+    const wtUnit = pick(row, normMap, ['weight_units']);
+    const volUnit = pick(row, normMap, ['volume_units']);
+    out.push({
+      marketplaceId, fnsku,
+      asin: pick(row, normMap, ['asin']) ?? null,
+      productName: pick(row, normMap, ['product_name', 'product-name']) ?? null,
+      longestSideCm: toCm(parseNumeric(pick(row, normMap, ['longest_side'])), lenUnit),
+      medianSideCm: toCm(parseNumeric(pick(row, normMap, ['median_side'])), lenUnit),
+      shortestSideCm: toCm(parseNumeric(pick(row, normMap, ['shortest_side'])), lenUnit),
+      weightKg: toKg(parseNumeric(pick(row, normMap, ['weight', 'item_weight'])), wtUnit),
+      itemVolumeM3: toM3(parseNumeric(pick(row, normMap, ['item_volume', 'volume'])), volUnit),
+      sizeTier: pick(row, normMap, ['product_size_tier', 'size_tier']) ?? null,
+      snapshotMonth: parseChargeMonth(pick(row, normMap, ['month_of_charge', 'charge_month', 'month']), fallbackMonth),
+    });
+  }
+  return out;
+}
+
 export interface IngestStorageFeesOpts {
   spClient: SpApiClient;
   pg: PgClient;
@@ -244,6 +302,26 @@ export async function ingestStorageFees(opts: IngestStorageFeesOpts): Promise<In
     );
     result.rowsUpserted += 1;
   }
+
+  // Per-item packaged dimensions (knowledge base) from the same report.
+  const dims = parseItemDimensions(report.rawText, marketplaceId, dataEndTime);
+  for (const d of dims) {
+    await opts.pg.query(
+      `INSERT INTO brain.fba_item_dimensions (
+         marketplace_id, fnsku, asin, product_name, longest_side_cm, median_side_cm,
+         shortest_side_cm, item_weight_kg, item_volume_m3, product_size_tier, snapshot_month, ingested_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
+       ON CONFLICT (marketplace_id, fnsku) DO UPDATE SET
+         asin=EXCLUDED.asin, product_name=EXCLUDED.product_name,
+         longest_side_cm=EXCLUDED.longest_side_cm, median_side_cm=EXCLUDED.median_side_cm,
+         shortest_side_cm=EXCLUDED.shortest_side_cm, item_weight_kg=EXCLUDED.item_weight_kg,
+         item_volume_m3=EXCLUDED.item_volume_m3, product_size_tier=EXCLUDED.product_size_tier,
+         snapshot_month=EXCLUDED.snapshot_month, ingested_at=NOW()`,
+      [d.marketplaceId, d.fnsku, d.asin, d.productName, d.longestSideCm, d.medianSideCm,
+       d.shortestSideCm, d.weightKg, d.itemVolumeM3, d.sizeTier, d.snapshotMonth],
+    );
+  }
+
   result.monthsSeen = Array.from(months).sort();
   return result;
 }
