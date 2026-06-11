@@ -61,6 +61,10 @@ ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS carton_length_cm      NUME
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS carton_width_cm       NUMERIC(8,2);
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS carton_height_cm      NUMERIC(8,2);
 ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS carton_weight_kg      NUMERIC(8,3);
+-- US inbound box cost computed from the UPS rate card (compute-us-inbound CLI):
+-- billed weight (max actual vs L*W*H/5000) -> freight band -> MRPP floor. GBP.
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_box_cost_gbp     NUMERIC(12,4);
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS us_inbound_billed_weight_kg NUMERIC(8,3);
 
 COMMENT ON COLUMN brain.sku_master.units_per_case IS
 'Units per master carton, from sku-packaging.csv (authoritative; NOT derived). NULL = SKU has no clean master carton (reworked at inbound) -> volumetric fallback.';
@@ -79,7 +83,7 @@ SELECT
     l.marketplace_id, l.asin, l.fnsku, l.canonical_sku, sku_x.seller_sku,
     l.all_skus, l.sku_count, (l.sku_count > 1) AS fnsku_fanout,
     sm.ean, sm.brand, sm.cogs_landed, sm.cogs_currency, sm.fba_fee,
-    sm.units_per_case, sm.units_per_case_source
+    sm.units_per_case, sm.units_per_case_source, sm.us_inbound_box_cost_gbp
 FROM latest l
 CROSS JOIN LATERAL unnest(l.all_skus) AS sku_x(seller_sku)
 LEFT JOIN brain.sku_master sm ON sm.asin = l.asin;
@@ -113,6 +117,7 @@ attrs AS (
            MAX(cogs_landed) AS cogs_landed, MAX(cogs_currency) AS cogs_currency,
            MAX(brand) AS brand, MAX(units_per_case) AS units_per_case,
            MAX(units_per_case_source) AS units_per_case_source,
+           MAX(us_inbound_box_cost_gbp) AS us_inbound_box_cost_gbp,
            bool_or(fnsku_fanout) AS fnsku_fanout
     FROM analytics.product_cost_crosswalk GROUP BY marketplace_id, asin
 ),
@@ -191,7 +196,13 @@ calc AS (
         ads.ads_total, ret.nonsellable_units, sl.storage_base, sl.aged_surcharge, sl.storage_source,
         st.units_ordered_st, uv.unit_vol_m3,
         ifr.cost_per_box, ifr.currency_code AS box_ccy, ifr.max_box_volume_m3,
-        (ifr.cost_per_box * COALESCE(bfx.rate,1)) AS box_cost_gbp,
+        a.us_inbound_box_cost_gbp,
+        -- US box cost is per-SKU from the UPS rate card (us_inbound_box_cost_gbp,
+        -- already GBP); UK is the flat DPD box cost. Fall back to the flat
+        -- inbound_freight_rate cost where the per-SKU US figure is absent.
+        CASE WHEN fe.marketplace_id = 'ATVPDKIKX0DER'
+             THEN COALESCE(a.us_inbound_box_cost_gbp, ifr.cost_per_box * COALESCE(bfx.rate,1))
+             ELSE ifr.cost_per_box * COALESCE(bfx.rate,1) END AS box_cost_gbp,
         COALESCE(cfx.rate,1) AS cogs_rate,
         m.country_code, m.country_name
     FROM fe
@@ -269,6 +280,71 @@ FROM final;
 
 COMMENT ON VIEW analytics.product_profitability_30d IS
 'Per-(marketplace, asin) CM1/CM2/CM3 over trailing 30d, all in GBP (every line FX-converted via meta.fx_rates before summing - fixes the NA USD/CAD/GBP mix). CM1 nets landed COGS + inbound freight. inbound_source: case_qty (box cost / units_per_case from sku-packaging.csv) | volumetric_fallback (box cost / units-per-max-Amazon-box, from storage-report unit volume) | missing. confidence high only with case_qty + per_fnsku storage.';
+
+-- ----------------------------------------------------------------------------
+-- analytics.product_profitability_reconciliation — GBP rework.
+-- 0033's version summed financial_events / settlement_lines in native currency,
+-- so the NA USD/CAD/GBP mix inflated US variance into noise. Convert both sides
+-- to GBP via meta.fx_rates so the variance is meaningful (and the QA job's
+-- variance flag stops false-firing on every US SKU).
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW analytics.product_profitability_reconciliation AS
+WITH win AS (SELECT (CURRENT_DATE - INTERVAL '90 days')::date AS s, CURRENT_DATE AS e),
+fx_map AS (
+    SELECT 'GBP'::text AS ccy, 1.0::numeric AS rate
+    UNION ALL
+    SELECT base_currency, rate FROM (
+        SELECT DISTINCT ON (base_currency) base_currency, rate
+        FROM meta.fx_rates WHERE quote_currency='GBP' AND rate_date <= CURRENT_DATE
+        ORDER BY base_currency, rate_date DESC
+    ) l
+),
+sku_asin AS (SELECT DISTINCT marketplace_id, seller_sku, asin FROM analytics.product_cost_crosswalk),
+computed AS (
+    SELECT cw.marketplace_id, cw.asin,
+           SUM((CASE WHEN f.direction='credit' THEN f.amount ELSE -f.amount END) * COALESCE(fx.rate,1)) AS computed_net
+    FROM brain.financial_events f
+    JOIN sku_asin cw ON cw.marketplace_id=f.marketplace_id AND cw.seller_sku=f.sku
+    LEFT JOIN fx_map fx ON fx.ccy = TRIM(f.currency_code)
+    WHERE f.event_type IN ('ShipmentEvent','RefundEvent','AdjustmentEvent')
+      AND f.posted_date >= (SELECT s FROM win) AND f.posted_date < (SELECT e FROM win)
+    GROUP BY cw.marketplace_id, cw.asin
+),
+settled AS (
+    SELECT s.marketplace_id, cw.asin, SUM(sl.amount * COALESCE(fx.rate,1)) AS settled_net
+    FROM brain.settlement_lines sl
+    JOIN brain.settlements s ON s.settlement_id = sl.settlement_id
+    JOIN sku_asin cw ON cw.marketplace_id=s.marketplace_id AND cw.seller_sku=sl.sku
+    LEFT JOIN fx_map fx ON fx.ccy = TRIM(sl.currency_code)
+    WHERE sl.sku IS NOT NULL
+      AND sl.posted_date >= (SELECT s FROM win) AND sl.posted_date < (SELECT e FROM win)
+    GROUP BY s.marketplace_id, cw.asin
+),
+unmatched AS (
+    SELECT s.marketplace_id, SUM(sl.amount * COALESCE(fx.rate,1)) AS unmatched_settlement_amount
+    FROM brain.settlement_lines sl
+    JOIN brain.settlements s ON s.settlement_id = sl.settlement_id
+    LEFT JOIN fx_map fx ON fx.ccy = TRIM(sl.currency_code)
+    WHERE sl.sku IS NULL
+      AND sl.posted_date >= (SELECT s FROM win) AND sl.posted_date < (SELECT e FROM win)
+    GROUP BY s.marketplace_id
+)
+SELECT
+    COALESCE(c.marketplace_id, se.marketplace_id) AS marketplace_id,
+    COALESCE(c.asin, se.asin)                     AS asin,
+    (SELECT s FROM win) AS period_start, (SELECT e FROM win) AS period_end,
+    ROUND(COALESCE(c.computed_net,0),2)           AS computed_net,
+    ROUND(COALESCE(se.settled_net,0),2)           AS settled_net,
+    ROUND(COALESCE(se.settled_net,0) - COALESCE(c.computed_net,0),2) AS variance_abs,
+    CASE WHEN COALESCE(se.settled_net,0) <> 0
+         THEN ROUND(100.0*(COALESCE(se.settled_net,0)-COALESCE(c.computed_net,0))/ABS(se.settled_net),1) END AS variance_pct,
+    ROUND(COALESCE(u.unmatched_settlement_amount,0),2) AS unmatched_settlement_amount
+FROM computed c
+FULL OUTER JOIN settled se USING (marketplace_id, asin)
+LEFT JOIN unmatched u ON u.marketplace_id = COALESCE(c.marketplace_id, se.marketplace_id);
+
+COMMENT ON VIEW analytics.product_profitability_reconciliation IS
+'Drift detector: computed net (financial_events, product-attributable) vs settled net (settlement_lines by sku) per (marketplace, asin) over trailing 90d, both converted to GBP via meta.fx_rates (fixes the NA currency mix). Non-product/no-sku settlement lines are excluded from the per-ASIN comparison and shown as unmatched_settlement_amount. Approximate (posted vs settled timing differs) - a coarse alarm, not a ledger.';
 
 INSERT INTO meta.migration_history (filename)
 VALUES ('0034_inbound_freight_and_gbp_cm.sql')
