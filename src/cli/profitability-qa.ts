@@ -58,7 +58,12 @@ async function main(): Promise<void> {
     );
 
     const negative = rows.filter((r) => n(r.cm3_margin_pct) !== null && n(r.cm3_margin_pct)! < 0);
-    const negConfident = negative.filter((r) => r.confidence !== 'low');
+    // CRITICAL only when the cost basis is real: a known case qty (so inbound is
+    // the actual box cost / pack, not a volumetric guess). Negatives that hinge
+    // on a volumetric-fallback inbound estimate are a DATA gap, not a confirmed
+    // loss — surfaced separately so they don't false-fail the gate.
+    const negConfident = negative.filter((r) => r.confidence !== 'low' && r.inbound_source === 'case_qty');
+    const negFallback = negative.filter((r) => r.inbound_source === 'volumetric_fallback');
     const thin = rows.filter((r) => { const m = n(r.cm3_margin_pct); return m !== null && m >= 0 && m < marginWarn; });
     const lowConf = rows.filter((r) => r.confidence === 'low');
     const variance = rows.filter((r) => n(r.variance_pct) !== null && Math.abs(n(r.variance_pct)!) > varianceTol);
@@ -72,8 +77,11 @@ async function main(): Promise<void> {
     const log = (s = '') => { lines.push(s); };
     log(`# Profitability QA — ${rows.length} SKU-marketplace rows (revenue ≥ £${minRevenue})`);
     log('');
-    log(`CRITICAL — confidently negative CM3: ${negConfident.length}`);
+    log(`CRITICAL — negative CM3 on a real cost basis (case qty known): ${negConfident.length}`);
     negConfident.slice(0, 40).forEach((r) => log(fmtRow(r)));
+    log('');
+    log(`WARN — negative CM3 but inbound is a volumetric estimate (add carton data to confirm): ${negFallback.length}`);
+    negFallback.slice(0, 20).forEach((r) => log(fmtRow(r)));
     log('');
     log(`WARN — thin CM3 (0–${marginWarn}%): ${thin.length}`);
     thin.slice(0, 20).forEach((r) => log(fmtRow(r)));
