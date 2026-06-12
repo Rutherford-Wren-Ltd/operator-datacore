@@ -26,6 +26,12 @@ import { parseArgs } from 'node:util';
 import { getPgClient } from '../lib/supabase.js';
 
 const HTS_API = 'https://hts.usitc.gov/reststop/exportList';
+// Base MFN/general rates are the current, relatively-stable schedule. Stamp them
+// from a backdated floor so they resolve for historical import dates too (the
+// resolver matches effective_from <= the queried date). Effective-dating exists
+// for genuine FUTURE rate changes, which add a new row at the change date; the
+// volatile policy tariffs live in brain.tariff_overlay with their own dates.
+const BASE_EFFECTIVE_FROM = '2020-01-01';
 const onlyDigits = (s: string) => (s || '').replace(/[^0-9]/g, '');
 
 function parseRate(s: string | null | undefined): number | null {
@@ -79,9 +85,9 @@ async function main(): Promise<void> {
         if (values['dry-run']) { upserted++; continue; }
         await pg.query(
           `INSERT INTO brain.hts_base_rate (hs10, general_rate_pct, effective_from, source, ingested_at)
-           VALUES ($1,$2,CURRENT_DATE,'usitc_hts',NOW())
+           VALUES ($1,$2,$3::date,'usitc_hts',NOW())
            ON CONFLICT (hs10, effective_from) DO UPDATE SET general_rate_pct=EXCLUDED.general_rate_pct, source='usitc_hts', ingested_at=NOW()`,
-          [code, best.rate.toFixed(4)],
+          [code, best.rate.toFixed(4), BASE_EFFECTIVE_FROM],
         );
         upserted++;
       }
