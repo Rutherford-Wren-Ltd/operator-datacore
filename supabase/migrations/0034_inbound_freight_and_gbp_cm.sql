@@ -130,35 +130,164 @@ COMMENT ON VIEW analytics.product_cost_crosswalk IS
 -- analytics.product_profitability_30d — GBP CM ladder + inbound freight.
 -- DROP+CREATE: column shape changes vs 0033.
 -- ----------------------------------------------------------------------------
+-- ============================================================================
+-- DYNAMIC TARIFFS + BATCH-LOCKED DUTY COSTING
+-- Country-aware, time-versioned duty: base HTS rate (auto-synced from USITC) +
+-- policy overlays (China 301 / 2025 reciprocal). Each import batch books the
+-- rate on its arrival date as an immutable cost; cost of sale = weighted moving
+-- average over remaining (FIFO-determined open) units. Falls back to a current-
+-- rate estimate where no layer exists.
+-- ============================================================================
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS country_of_origin TEXT;     -- ISO-2, from UPS catalogue
+ALTER TABLE brain.sku_master ADD COLUMN IF NOT EXISTS customs_value_usd NUMERIC(12,4); -- declared customs value/unit
+
+-- Base MFN/general duty per HS code (USITC HTS 'general' column), effective-dated.
+CREATE TABLE IF NOT EXISTS brain.hts_base_rate (
+    hs10             TEXT NOT NULL,
+    general_rate_pct NUMERIC(7,4) NOT NULL,
+    effective_from   DATE NOT NULL DEFAULT CURRENT_DATE,
+    source           TEXT,
+    ingested_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (hs10, effective_from)
+);
+CREATE INDEX IF NOT EXISTS idx_hts_base_rate_hs ON brain.hts_base_rate (hs10);
+
+-- Policy overlays: 301 / reciprocal / country-specific. is_exclusion zeroes out.
+CREATE TABLE IF NOT EXISTS brain.tariff_overlay (
+    programme       TEXT NOT NULL,            -- sec_301 | reciprocal_2025 | ...
+    origin_country  TEXT NOT NULL,            -- ISO-2, or '*' = any
+    hs_prefix       TEXT NOT NULL DEFAULT '', -- '' = all codes
+    add_pct         NUMERIC(7,4) NOT NULL,
+    is_exclusion    BOOLEAN NOT NULL DEFAULT FALSE,
+    effective_from  DATE NOT NULL DEFAULT CURRENT_DATE,
+    effective_to    DATE,
+    legal_ref       TEXT,                     -- Federal Register / USTR / 9903.xx
+    source          TEXT,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (programme, origin_country, hs_prefix, effective_from)
+);
+CREATE INDEX IF NOT EXISTS idx_tariff_overlay_lookup ON brain.tariff_overlay (origin_country, hs_prefix);
+-- Seed the China stack so CN reproduces ~60% before the sync refines it; non-CN
+-- gets base only. Operator/sync trues these up to actual UPS/broker figures.
+INSERT INTO brain.tariff_overlay (programme, origin_country, hs_prefix, add_pct, effective_from, legal_ref, source) VALUES
+    ('sec_301',        'CN', '', 0.2500, '2025-01-01', '9903.88.x', 'seed'),
+    ('reciprocal_2025','CN', '', 0.3250, '2025-01-01', 'IEEPA 2025', 'seed')
+ON CONFLICT (programme, origin_country, hs_prefix, effective_from) DO NOTHING;
+
+-- Immutable per-batch duty cost layers (cost of sale by time-in-stock).
+CREATE TABLE IF NOT EXISTS brain.sku_duty_layer (
+    layer_id           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ean                TEXT NOT NULL,
+    region             TEXT NOT NULL DEFAULT 'na',
+    import_date        DATE NOT NULL,
+    units              INTEGER NOT NULL,
+    customs_value_gbp  NUMERIC(12,4),
+    hs_code            TEXT,
+    origin             TEXT,
+    duty_rate_locked   NUMERIC(7,4),
+    duty_per_unit_gbp  NUMERIC(12,4),
+    basis              TEXT NOT NULL DEFAULT 'modelled',   -- modelled | actual
+    source_po_line_id  UUID,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (source_po_line_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sku_duty_layer_ean ON brain.sku_duty_layer (ean, import_date);
+
+-- Resolver: base (longest HS prefix, effective on_date) + additive overlays −
+-- exclusions for (origin, date). NULL only on a genuine no-base-match (so a
+-- matched 0% stays 0, never mistaken for missing).
+CREATE OR REPLACE FUNCTION analytics.fn_us_duty_rate(p_hs TEXT, p_origin TEXT, p_on DATE)
+RETURNS NUMERIC LANGUAGE sql STABLE AS $fn$
+  WITH hsd AS (SELECT regexp_replace(COALESCE(p_hs,''), '[^0-9]', '', 'g') AS d),
+  base AS (
+    SELECT b.general_rate_pct AS pct
+    FROM brain.hts_base_rate b, hsd
+    WHERE b.effective_from <= p_on
+      AND hsd.d LIKE regexp_replace(b.hs10,'[^0-9]','','g') || '%'
+      AND length(regexp_replace(b.hs10,'[^0-9]','','g')) > 0
+    ORDER BY length(regexp_replace(b.hs10,'[^0-9]','','g')) DESC, b.effective_from DESC
+    LIMIT 1
+  ),
+  ov AS (
+    SELECT COALESCE(SUM(CASE WHEN o.is_exclusion THEN -o.add_pct ELSE o.add_pct END),0) AS pct
+    FROM brain.tariff_overlay o, hsd
+    WHERE (o.origin_country = COALESCE(p_origin,'') OR o.origin_country = '*')
+      AND o.effective_from <= p_on AND (o.effective_to IS NULL OR o.effective_to > p_on)
+      AND hsd.d LIKE regexp_replace(o.hs_prefix,'[^0-9]','','g') || '%'
+  )
+  SELECT CASE WHEN (SELECT pct FROM base) IS NULL THEN NULL
+              ELSE (SELECT pct FROM base) + (SELECT pct FROM ov) END;
+$fn$;
+
+-- FIFO depletion: cumulative settled US units consume layers oldest-first ->
+-- remaining_units per open layer (so sold-out batches drop out of the average).
+CREATE OR REPLACE VIEW analytics.sku_us_duty_layer_open AS
+WITH lay AS (
+    SELECT l.layer_id, sm.asin, l.ean, l.import_date, l.units, l.duty_per_unit_gbp, l.basis,
+        SUM(l.units) OVER (PARTITION BY sm.asin ORDER BY l.import_date, l.layer_id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cum_units
+    FROM brain.sku_duty_layer l
+    JOIN brain.sku_master sm ON sm.ean = l.ean
+    WHERE l.region = 'na' AND l.import_date <= CURRENT_DATE  -- only stock landed by now; future/in-transit POs don't cost current sales
+),
+settled AS (
+    SELECT cw.asin, COUNT(*) AS settled_units
+    FROM brain.financial_events f
+    JOIN analytics.product_cost_crosswalk cw
+      ON cw.marketplace_id = f.marketplace_id AND (cw.seller_sku = f.sku OR f.sku = ANY(cw.all_skus))
+    WHERE f.marketplace_id='ATVPDKIKX0DER' AND f.event_type='ShipmentEvent' AND f.fee_description='Principal'
+    GROUP BY cw.asin
+)
+SELECT lay.*, COALESCE(s.settled_units,0) AS settled_units,
+    GREATEST(0, LEAST(lay.units, lay.cum_units - COALESCE(s.settled_units,0))) AS remaining_units
+FROM lay LEFT JOIN settled s ON s.asin = lay.asin;
+
+-- Per-ASIN costed duty: weighted moving average over open layers, else a current-
+-- rate estimate on the customs value (FOB/cogs fallback), else the '*' default.
+CREATE OR REPLACE VIEW analytics.sku_us_duty_costed AS
+WITH cls AS (
+    SELECT DISTINCT ON (sm.asin) sm.asin, sm.ean, sm.hs_code_us, sm.country_of_origin,
+           sm.customs_value_usd, sm.cogs_landed
+    FROM brain.sku_master sm WHERE sm.asin IS NOT NULL
+    ORDER BY sm.asin, (sm.hs_code_us IS NOT NULL) DESC, sm.ean
+),
+fx AS (
+    SELECT rate FROM meta.fx_rates
+    WHERE base_currency='USD' AND quote_currency=(SELECT upper(reporting_currency) FROM meta.config LIMIT 1)
+    ORDER BY rate_date DESC LIMIT 1
+),
+dflt AS (SELECT total_pct FROM brain.us_import_duty_rate WHERE hs_code='*' ORDER BY effective_from DESC LIMIT 1),
+layered AS (
+    SELECT asin, SUM(remaining_units) AS ru, SUM(remaining_units*duty_per_unit_gbp) AS rd
+    FROM analytics.sku_us_duty_layer_open GROUP BY asin
+)
+SELECT c.asin, c.ean, c.hs_code_us, c.country_of_origin,
+    analytics.fn_us_duty_rate(c.hs_code_us, c.country_of_origin, CURRENT_DATE) AS hs_rate,
+    COALESCE(analytics.fn_us_duty_rate(c.hs_code_us, c.country_of_origin, CURRENT_DATE),
+             (SELECT total_pct FROM dflt), 0.602) AS duty_pct,
+    COALESCE(c.customs_value_usd * COALESCE((SELECT rate FROM fx),1), c.cogs_landed) AS duty_base_gbp,
+    CASE WHEN l.ru > 0 THEN l.rd / l.ru
+         ELSE COALESCE(analytics.fn_us_duty_rate(c.hs_code_us, c.country_of_origin, CURRENT_DATE),
+                       (SELECT total_pct FROM dflt), 0.602)
+              * COALESCE(c.customs_value_usd * COALESCE((SELECT rate FROM fx),1), c.cogs_landed)
+    END AS duty_per_unit_gbp,
+    CASE WHEN l.ru > 0 THEN 'layered'
+         WHEN analytics.fn_us_duty_rate(c.hs_code_us, c.country_of_origin, CURRENT_DATE) IS NOT NULL THEN 'estimated'
+         ELSE 'default' END AS duty_source
+FROM cls c LEFT JOIN layered l ON l.asin = c.asin;
+
+COMMENT ON VIEW analytics.sku_us_duty_costed IS
+'Per-ASIN US duty/unit (GBP). Weighted moving average over open import layers (sku_us_duty_layer_open) when present; else current country-aware rate (fn_us_duty_rate) x customs value; else the brain.us_import_duty_rate ''*'' default. duty_source: layered | estimated | default.';
+
 -- ----------------------------------------------------------------------------
--- analytics.sku_us_duty — per-ASIN US duty rate: longest HS-prefix match
--- effective today, else the '*' default. duty_source flags hs vs default.
+-- analytics.sku_us_duty — thin interface over the costed model (joined by the
+-- profitability view as the US import_duty line).
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW analytics.sku_us_duty AS
-WITH base AS (
-    SELECT DISTINCT ON (sm.asin) sm.asin, sm.ean, sm.hs_code_us
-    FROM brain.sku_master sm
-    WHERE sm.asin IS NOT NULL
-    ORDER BY sm.asin, (sm.hs_code_us IS NOT NULL) DESC, sm.ean
-)
-SELECT b.asin, b.ean, b.hs_code_us,
-    COALESCE(m.total_pct, dflt.total_pct, 0.60) AS duty_pct,
-    CASE WHEN m.total_pct IS NOT NULL THEN 'hs' ELSE 'default' END AS duty_source
-FROM base b
-LEFT JOIN LATERAL (
-    SELECT r.total_pct FROM brain.us_import_duty_rate r
-    WHERE r.hs_code <> '*' AND b.hs_code_us LIKE r.hs_code || '%' AND r.effective_from <= CURRENT_DATE
-    ORDER BY LENGTH(r.hs_code) DESC, r.effective_from DESC LIMIT 1
-) m ON TRUE
-LEFT JOIN LATERAL (
-    SELECT total_pct FROM brain.us_import_duty_rate WHERE hs_code='*' AND effective_from <= CURRENT_DATE
-    ORDER BY effective_from DESC LIMIT 1
-) dflt ON TRUE;
+SELECT asin, ean, hs_code_us, duty_pct, duty_source, duty_per_unit_gbp
+FROM analytics.sku_us_duty_costed;
 
-COMMENT ON VIEW analytics.sku_us_duty IS
-'Per-ASIN US import duty rate. Longest HS-prefix match in brain.us_import_duty_rate effective today; falls back to the ''*'' default row (duty_source=default). Joined into product_profitability_30d as the US import_duty line.';
-
-DROP VIEW IF EXISTS analytics.product_profitability_30d;
+DROP VIEW IF EXISTS analytics.product_profitability_30d CASCADE;  -- cascades to us_tariff_exposure (recreated below)
 CREATE VIEW analytics.product_profitability_30d AS
 WITH params AS (
     SELECT (CURRENT_DATE - INTERVAL '30 days')::date AS win_start,
@@ -287,7 +416,7 @@ calc AS (
         -- (us_inbound_per_unit_gbp: UPS-priced from carton/item dims).
         (ifr.cost_per_box * COALESCE(bfx.rate,1)) AS box_cost_gbp,
         COALESCE(cfx.rate,1) AS cogs_rate,
-        d.duty_pct, d.duty_source, fb.us_fob_gbp, fb.fob_source,
+        d.duty_pct, d.duty_per_unit_gbp, d.duty_source, fb.us_fob_gbp, fb.fob_source,
         COALESCE(rt.is_direct_awd, FALSE) AS is_direct_awd,
         m.country_code, m.country_name
     FROM fe
@@ -309,7 +438,9 @@ final AS (
     SELECT *,
         (units_settled * cogs_landed * cogs_rate) AS cogs_total_calc,
         -- US import duty = FOB x duty_pct (UK has none). Discrete landed-cost line.
-        CASE WHEN marketplace_id = 'ATVPDKIKX0DER' THEN COALESCE(us_fob_gbp,0) * COALESCE(duty_pct,0) ELSE 0 END AS import_duty_per_unit,
+        -- US duty/unit is precomputed by sku_us_duty_costed (layered moving avg, or
+        -- country-aware current-rate estimate on the customs value). UK = 0.
+        CASE WHEN marketplace_id = 'ATVPDKIKX0DER' THEN COALESCE(duty_per_unit_gbp,0) ELSE 0 END AS import_duty_per_unit,
         CASE
             -- Direct-AWD US: China->US freight is in the (pending) AWD landing, NOT
             -- UK->US UPS — drop the wrong-route proxy rather than stack it on duty.
