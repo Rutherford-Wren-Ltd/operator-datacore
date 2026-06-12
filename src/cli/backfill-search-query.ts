@@ -426,7 +426,8 @@ async function main(): Promise<void> {
 
     console.log('');
     console.log(
-      `Done in ${durationMin} min. ${result.tasksRun} call(s) made, ${result.tasksSkipped} skipped, ` +
+      `Done in ${durationMin} min. ${result.tasksRun} call(s) made, ${result.tasksSkipped} skipped (--skip-existing), ` +
+      `${result.tasksNoData} (asin, period) tuple(s) returned no data (FATAL/CANCELLED — logged to meta.sync_log), ` +
       `${result.totalRows} rows upserted across ${marketplaceIds.length} marketplace(s), ${result.periodCount} period(s), ${result.asinCount} ASIN(s).`,
     );
   } finally {
