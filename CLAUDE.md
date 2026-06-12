@@ -108,6 +108,16 @@ These come from previous client work. Keep them sacred.
 
 ---
 
+## Data coverage gotchas (when reading the lake)
+
+Lessons from real audits. Check these before trusting a number.
+
+1. **Brand Analytics (SQP) is sparse and operator-run.** `brain.search_query_performance` is NOT in daily-sync; it is filled only when someone runs `npm run backfill-search-query` for a specific ASIN. As of 2026-06, the table held only two test ASINs (`B0CX9FCC59` UK, `B0BLZ93P73` US). **Most ASINs return zero rows.** Zero rows means "never backfilled", not "no search traffic". Before reporting on a SKU's keyword funnel, confirm coverage; if empty, run the backfill scoped to that ASIN (UK and US separately) per [docs/runbooks/search-query-backfill.md](./docs/runbooks/search-query-backfill.md).
+2. **`product_profitability_30d` confidence is not the same as agreement with settlement.** A row can read `confidence: high` / `storage_source: per_fnsku` and still be materially wrong. Always also read `analytics.product_profitability_reconciliation` for the ASIN: if `|variance_pct| > 5pp`, report the CM3 as **unverified** and down-rank it (we have seen UK 17% / US 79% variance with large `unmatched_settlement_amount` on a SKU the profitability view rated high). Trust requires both views to agree.
+3. **Per-FNSKU storage is backward-looking.** `storage_base` reflects units that were physically on hand in the *settled* month. A fresh overstock that just landed has near-zero storage in the current 30d window; its real storage and long-term-storage-fee (LTSF) cost lands on a *future* bill (e.g. units arriving in June first bill in July). A low `storage_base` on an overstocked SKU is a timing artefact, not a clean bill of health. Flag the forward liability explicitly.
+
+---
+
 ## When the user gets stuck
 
 Common failure modes and what to say:
