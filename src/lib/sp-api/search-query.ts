@@ -40,7 +40,7 @@ import parserStream from 'stream-json';
 import pick from 'stream-json/filters/pick.js';
 import streamArray from 'stream-json/streamers/stream-array.js';
 import { SpApiClient } from './client.js';
-import { downloadReportToFile } from './reports.js';
+import { downloadReportToFile, ReportFatalError, ReportCancelledError } from './reports.js';
 import { getPgClient } from '../supabase.js';
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -118,6 +118,7 @@ export interface IngestSqpPeriodOptions {
  */
 export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
   rowsUpserted: number;
+  skipped?: 'fatal' | 'cancelled';
 }> {
   // Choose a temp file path. Use a per-call random suffix to avoid
   // collisions if two CLI processes happen to overlap.
@@ -128,16 +129,49 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
   let meta: { reportId: string; reportDocumentId?: string; processingStatus: string };
   let bytesWritten: number;
   try {
-    const downloadResult = await downloadReportToFile(opts.spClient, {
-      reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
-      marketplaceIds: [opts.marketplaceId],
-      dataStartTime: opts.periodStart,
-      dataEndTime: opts.periodEnd,
-      reportOptions: {
-        reportPeriod: opts.periodType,
-        asin: opts.asin,
-      },
-    }, tmpPath);
+    let downloadResult;
+    try {
+      downloadResult = await downloadReportToFile(opts.spClient, {
+        reportType: 'GET_BRAND_ANALYTICS_SEARCH_QUERY_PERFORMANCE_REPORT',
+        marketplaceIds: [opts.marketplaceId],
+        dataStartTime: opts.periodStart,
+        dataEndTime: opts.periodEnd,
+        reportOptions: {
+          reportPeriod: opts.periodType,
+          asin: opts.asin,
+        },
+      }, tmpPath);
+    } catch (err) {
+      // FATAL / CANCELLED for SQP empirically means: no data for this
+      // (period, marketplace, asin) tuple — typically pre-launch or
+      // not-yet-published. Log a warning and skip. Anything else propagates.
+      if (err instanceof ReportFatalError || err instanceof ReportCancelledError) {
+        const reason = err instanceof ReportFatalError ? 'fatal' : 'cancelled';
+        const periodStartStr = opts.periodStart.toISOString().slice(0, 10);
+        const message =
+          `No SQP data for (asin=${opts.asin}, marketplace=${opts.marketplaceId}, ` +
+          `${opts.periodType.toLowerCase()}=${periodStartStr}) — Amazon returned ${reason.toUpperCase()}. ` +
+          `Likely pre-launch or not-yet-published.`;
+        await opts.pg.query(
+          `INSERT INTO meta.sync_log (sync_run_id, level, message, payload)
+           VALUES ($1, 'warn', $2, $3)`,
+          [
+            opts.syncRunId,
+            message,
+            JSON.stringify({
+              report_id: err.reportId,
+              status: reason.toUpperCase(),
+              asin: opts.asin,
+              marketplace_id: opts.marketplaceId,
+              period_type: opts.periodType,
+              period_start: periodStartStr,
+            }),
+          ],
+        );
+        return { rowsUpserted: 0, skipped: reason };
+      }
+      throw err;
+    }
     meta = downloadResult.meta;
     bytesWritten = downloadResult.bytesWritten;
 
@@ -361,6 +395,7 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
   asinCount: number;
   tasksRun: number;
   tasksSkipped: number;
+  tasksNoData: number;        // (asin, period, marketplace) tuples Amazon returned FATAL/CANCELLED for
   totalRows: number;
   pg: PgClient;
 }> {
@@ -392,17 +427,18 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
   const tasksSkipped = allTasks.length - tasks.length;
 
   if (tasks.length === 0) {
-    return { periodCount: periods.length, asinCount: opts.asins.length, tasksRun: 0, tasksSkipped, totalRows: 0, pg: opts.pg };
+    return { periodCount: periods.length, asinCount: opts.asins.length, tasksRun: 0, tasksSkipped, tasksNoData: 0, totalRows: 0, pg: opts.pg };
   }
 
   let activePg: PgClient = opts.pg;
   let totalRows = 0;
   let done = 0;
+  let tasksNoData = 0;
 
   for (const t of tasks) {
     const period = periods.find((p) => p.start.toISOString().slice(0, 10) === t.periodStartIso)!;
 
-    const { rowsUpserted } = await ingestSqpPeriod({
+    const { rowsUpserted, skipped } = await ingestSqpPeriod({
       spClient: opts.spClient,
       pg: activePg,
       connectionId: opts.connectionId,
@@ -415,6 +451,7 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
     });
 
     totalRows += rowsUpserted;
+    if (skipped) tasksNoData++;
     done++;
     opts.onProgress?.({
       periodStart: period.start.toISOString().slice(0, 10),
@@ -436,6 +473,7 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
     asinCount: opts.asins.length,
     tasksRun: tasks.length,
     tasksSkipped,
+    tasksNoData,
     totalRows,
     pg: activePg,
   };

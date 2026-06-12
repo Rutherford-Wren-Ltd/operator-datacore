@@ -21,6 +21,25 @@ export class ReportCancelledError extends Error {
   }
 }
 
+/**
+ * Thrown when Amazon ends a report with processingStatus=FATAL. The docs frame
+ * this as "request malformed", but empirically for SQP it also fires when the
+ * (ASIN, marketplace, period) tuple has no data — typically because the ASIN
+ * launched after the requested period, or Amazon hasn't yet published the most
+ * recent month/week. Callers iterating over tuples should catch + skip rather
+ * than aborting the whole run; the FATAL tuple is structurally unreachable and
+ * retrying won't help. Confirmed empirically 2026-06-12 backfilling top-20
+ * Wrenbury/Hemswell/Muldale ASINs (see [[sqp-backfill-fatal-on-prelaunch]]).
+ */
+export class ReportFatalError extends Error {
+  readonly reportId: string;
+  constructor(reportId: string) {
+    super(`Report ${reportId} ended with status FATAL`);
+    this.name = 'ReportFatalError';
+    this.reportId = reportId;
+  }
+}
+
 interface CreateReportResp {
   reportId: string;
 }
@@ -94,7 +113,7 @@ export async function runReport(client: SpApiClient, opts: RunReportOpts): Promi
       throw new ReportCancelledError(reportId);
     }
     if (meta.processingStatus === 'FATAL') {
-      throw new Error(`Report ${reportId} ended with status FATAL`);
+      throw new ReportFatalError(reportId);
     }
     await sleep(Math.min(waitMs, maxWaitMs));
     waitMs = Math.min(waitMs * 1.5, maxWaitMs);
@@ -164,7 +183,7 @@ export async function downloadReportToFile(
       throw new ReportCancelledError(reportId);
     }
     if (meta.processingStatus === 'FATAL') {
-      throw new Error(`Report ${reportId} ended with status FATAL`);
+      throw new ReportFatalError(reportId);
     }
     await sleep(Math.min(waitMs, maxWaitMs));
     waitMs = Math.min(waitMs * 1.5, maxWaitMs);
@@ -245,7 +264,7 @@ export async function streamReport(client: SpApiClient, opts: RunReportOpts): Pr
       throw new ReportCancelledError(reportId);
     }
     if (meta.processingStatus === 'FATAL') {
-      throw new Error(`Report ${reportId} ended with status FATAL`);
+      throw new ReportFatalError(reportId);
     }
     await sleep(Math.min(waitMs, maxWaitMs));
     waitMs = Math.min(waitMs * 1.5, maxWaitMs);
