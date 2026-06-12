@@ -56,6 +56,7 @@
     "import-hs-codes": "tsx src/cli/import-hs-codes.ts",
     "import-duty-rates": "tsx src/cli/import-duty-rates.ts",
     "import-catalogue": "tsx src/cli/import-catalogue.ts",
+    "derive-origin": "tsx src/cli/derive-origin.ts",
     "sync-tariff-rates": "tsx src/cli/sync-tariff-rates.ts",
     "build-duty-layers": "tsx src/cli/build-duty-layers.ts",
     "compute-us-inbound": "tsx src/cli/compute-us-inbound.ts",
