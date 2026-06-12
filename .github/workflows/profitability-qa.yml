@@ -1,0 +1,56 @@
+name: Profitability QA
+
+# Standing reconciliation QA over analytics.product_profitability_30d +
+# product_profitability_reconciliation. Flags confidently-negative CM3,
+# incomplete-cost SKUs, and SKUs whose computed net disagrees with settlement
+# actuals — so margin drift is caught even when nobody runs an /sku-audit.
+#
+# Schedule: 08:37 UTC on the 18th of each month — after the month's FBA storage
+# (posts days 1–7) and long-term-storage/aged surcharges (mid-month) have landed
+# and been ingested, so CM3 reflects a complete cost stack. The job fails (red
+# run → GitHub notification) if there is any critical finding.
+
+on:
+  schedule:
+    - cron: '37 8 18 * *'
+  workflow_dispatch:
+    inputs:
+      variance_tol:
+        description: 'Reconciliation variance tolerance (pp) before flagging'
+        type: string
+        default: '30'
+
+permissions:
+  contents: read
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run profitability QA
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          TOL="${{ github.event.inputs.variance_tol || '30' }}"
+          # Tee the report into the job summary so it's visible without opening logs.
+          npm run profitability-qa -- --variance-tol "$TOL" --out qa-report.md | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profitability-qa-report
+          path: qa-report.md
+          if-no-files-found: ignore

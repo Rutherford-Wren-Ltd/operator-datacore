@@ -1,0 +1,57 @@
+name: Tariff Rates — Weekly
+
+# Keeps US import duty rates current, "like FX". Pulls the base MFN/general rate
+# per HS code from the USITC HTS API into brain.hts_base_rate (effective-dated,
+# never mutates history), then rebuilds the modelled duty cost layers so any
+# newly-arrived/updated POs pick up the latest rates. Policy overlays (China 301 /
+# 2025 reciprocal) live in brain.tariff_overlay and are maintained separately on
+# legislative events — this job does NOT scrape them.
+#
+# Reads/writes the data lake only (no Amazon API). Runs ~1-2 min.
+#
+# Scheduling: 05:00 UTC Monday, ahead of the restock engine (06:00). Manual:
+# GitHub Actions -> "Tariff Rates — Weekly" -> Run workflow.
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'   # Mondays 05:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write   # failure issue only
+
+jobs:
+  sync-tariffs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sync USITC base rates + refresh duty layers
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          npm run sync-tariff-rates
+          npm run build-duty-layers
+
+      - name: Open failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          gh issue create \
+            --title "Tariff rate sync FAILED — ${DATE}" \
+            --body "The weekly USITC tariff sync failed. See logs: ${RUN_URL}. Note: USITC HTS API outages are the usual cause; rates are effective-dated so a skipped week is safe."
