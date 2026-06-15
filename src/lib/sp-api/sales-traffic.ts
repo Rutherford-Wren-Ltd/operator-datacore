@@ -133,6 +133,44 @@ export async function ingestSalesTrafficDay(opts: RunSalesTrafficOptions): Promi
     const traffic = row.trafficByAsin;
     const currency = sales.orderedProductSales?.currencyCode ?? 'USD';
 
+    // Tier 1 #2 from project review (2026-06-15) — detect Amazon shape
+    // anomalies that the surrounding `?? 0` coercions would otherwise silently
+    // hide. We don't change the row's behaviour here (the schema is still
+    // NOT NULL DEFAULT 0 on the metric columns, and ASINs with truly zero
+    // activity legitimately omit fields) — just log to meta.sync_log so we
+    // have audit evidence of frequency. Once we see real volume, the right
+    // follow-up is dropping NOT NULL on the metric columns and switching the
+    // parameter list below to `?? null` so missing data is queryable.
+    const anomalies: string[] = [];
+    if (sales.orderedProductSales === undefined && (sales.unitsOrdered ?? 0) > 0) {
+      anomalies.push('orderedProductSales-missing-with-units>0');
+    }
+    if (sales.orderedProductSales === undefined && sales.unitsOrdered === undefined) {
+      anomalies.push('sales-block-empty');
+    }
+    if (traffic.sessions === undefined && traffic.pageViews === undefined) {
+      anomalies.push('traffic-block-empty');
+    }
+    if (anomalies.length > 0) {
+      await opts.pg.query(
+        `INSERT INTO meta.sync_log (sync_run_id, level, message, payload)
+         VALUES ($1, 'warn', $2, $3)`,
+        [
+          opts.syncRunId,
+          `Sales/Traffic shape anomaly for ASIN ${row.childAsin} on ${metricDate}: ${anomalies.join(', ')}`,
+          JSON.stringify({
+            marketplace_id: opts.marketplaceId,
+            metric_date: metricDate,
+            child_asin: row.childAsin,
+            parent_asin: row.parentAsin,
+            anomalies,
+            sales_keys: Object.keys(sales ?? {}),
+            traffic_keys: Object.keys(traffic ?? {}),
+          }),
+        ],
+      );
+    }
+
     await opts.pg.query(
       `INSERT INTO brain.sales_traffic_daily (
         marketplace_id, metric_date, parent_asin, child_asin, sku, currency_code,
