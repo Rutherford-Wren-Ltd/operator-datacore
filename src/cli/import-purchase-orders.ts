@@ -132,6 +132,13 @@ interface ImportStats {
   headers: { created: number; updated: number; skipped: number };
   lines: { inserted: number; deleted: number; skipped: number };
   folds: number;
+  // Packaging fold failures (Tier 1 #4 from project review 2026-06-15). Counts
+  // packaging lines whose landed_cost fell on the floor instead of folding into
+  // a product line. The unmatched case is always a hard error (refuses import);
+  // the nullRef case is a warning by default but escalates to a hard error
+  // under --strict. costNotAllocated is the running total of dropped landed
+  // cost — surfaced in the banner so the magnitude is visible.
+  foldFailures: { nullRef: number; unmatched: number; costNotAllocated: number };
   skuLandedCost: { inserted: number; updated: number; skippedOlder: number };
   warnings: { message: string; payload: Record<string, unknown> }[];
   errors: string[];
@@ -343,28 +350,37 @@ function parseLineRow(row: string[], idx: Record<string, number>): PoLineRow | {
 // product line it points at, landing in that product's comp_packaging_allocated
 // and re-summing its landed_cost. Mutates the product PoLineRow in place.
 // ----------------------------------------------------------------------------
-function applyPackagingFold(lines: PoLineRow[], stats: ImportStats): void {
+function applyPackagingFold(lines: PoLineRow[], stats: ImportStats, strict: boolean): void {
   const productByKey = new Map<string, PoLineRow>();
   for (const l of lines) {
     if (l.line_type === 'product') productByKey.set(`${l.po_number}\u0000${l.line_no}`, l);
   }
   for (const pkg of lines) {
     if (pkg.line_type !== 'packaging') continue;
+    const lostCost = pkg.landed_cost ?? 0;
     if (pkg.packages_line_no === null) {
-      stats.warnings.push({
-        message: `PO ${pkg.po_number} line ${pkg.line_no}: packaging line has no packages_line_no — its cost folds into no product line`,
-        payload: { po_number: pkg.po_number, line_no: pkg.line_no },
-      });
+      stats.foldFailures.nullRef++;
+      stats.foldFailures.costNotAllocated = round6(stats.foldFailures.costNotAllocated + lostCost);
+      const msg = `PO ${pkg.po_number} line ${pkg.line_no}: packaging line has no packages_line_no — landed_cost ${lostCost} ${pkg.landed_cost_currency ?? ''} not folded into any product line`;
+      if (strict) {
+        stats.errors.push(msg);
+      } else {
+        stats.warnings.push({
+          message: msg,
+          payload: { po_number: pkg.po_number, line_no: pkg.line_no, landed_cost: lostCost, currency: pkg.landed_cost_currency },
+        });
+      }
       continue;
     }
     const product = productByKey.get(`${pkg.po_number}\u0000${pkg.packages_line_no}`);
     if (!product) {
-      stats.errors.push(`PO ${pkg.po_number} line ${pkg.line_no}: packages_line_no ${pkg.packages_line_no} does not match a product line in the same PO`);
+      stats.foldFailures.unmatched++;
+      stats.foldFailures.costNotAllocated = round6(stats.foldFailures.costNotAllocated + lostCost);
+      stats.errors.push(`PO ${pkg.po_number} line ${pkg.line_no}: packages_line_no ${pkg.packages_line_no} does not match a product line in the same PO — landed_cost ${lostCost} ${pkg.landed_cost_currency ?? ''} would be dropped`);
       continue;
     }
-    const add = pkg.landed_cost ?? 0;
-    product.comp_packaging_allocated = round6((product.comp_packaging_allocated ?? 0) + add);
-    product.landed_cost = round6((product.landed_cost ?? 0) + add);
+    product.comp_packaging_allocated = round6((product.comp_packaging_allocated ?? 0) + lostCost);
+    product.landed_cost = round6((product.landed_cost ?? 0) + lostCost);
     stats.folds++;
   }
 }
@@ -431,9 +447,16 @@ async function main(): Promise<void> {
       'workbook':     { type: 'string' },
       'workbook-dir': { type: 'string' },
       'dry-run':      { type: 'boolean', default: false },
+      // --strict escalates the "packaging line has no packages_line_no" warning
+      // to a hard error so the import refuses rather than silently dropping the
+      // packaging cost. The unmatched-line case is always hard-fail; --strict
+      // covers the missing-reference case too. Useful for CI / verification
+      // runs and one-off audits.
+      'strict':       { type: 'boolean', default: false },
     },
   });
   const dryRun = !!values['dry-run'];
+  const strict = !!values['strict'];
 
   console.log('operator-datacore — import purchase orders');
   console.log('-------------------------------------------');
@@ -532,6 +555,7 @@ async function main(): Promise<void> {
     headers: { created: 0, updated: 0, skipped: 0 },
     lines: { inserted: 0, deleted: 0, skipped: 0 },
     folds: 0,
+    foldFailures: { nullRef: 0, unmatched: 0, costNotAllocated: 0 },
     skuLandedCost: { inserted: 0, updated: 0, skippedOlder: 0 },
     warnings: [],
     errors: [],
@@ -577,7 +601,7 @@ async function main(): Promise<void> {
   }
 
   // Packaging fold + landed-cost drift check (no DB needed).
-  applyPackagingFold(lines, stats);
+  applyPackagingFold(lines, stats, strict);
   for (const l of lines) {
     if (l.line_type !== 'product') continue;
     if (l.stated_landed_cost === null || l.landed_cost === null) continue;
@@ -601,7 +625,21 @@ async function main(): Promise<void> {
   const packagingCount = lines.length - productCount;
   console.log(`Parsed ${headers.length} PO headers, ${lines.length} PO lines `
     + `(${productCount} product, ${packagingCount} packaging).`);
-  if (stats.folds > 0) console.log(`Packaging fold: ${stats.folds} line(s) folded into their product line.`);
+  if (stats.folds > 0 || stats.foldFailures.nullRef > 0 || stats.foldFailures.unmatched > 0) {
+    const failed = stats.foldFailures.nullRef + stats.foldFailures.unmatched;
+    let line = `Packaging fold: ${stats.folds} line(s) folded`;
+    if (failed > 0) {
+      const parts: string[] = [];
+      if (stats.foldFailures.nullRef > 0) parts.push(`${stats.foldFailures.nullRef} no packages_line_no`);
+      if (stats.foldFailures.unmatched > 0) parts.push(`${stats.foldFailures.unmatched} unmatched`);
+      line += `, ${failed} FAILED (${parts.join(', ')}; ${round6(stats.foldFailures.costNotAllocated)} cost would be unallocated)`;
+      if (stats.foldFailures.unmatched > 0) line += ' — import will refuse';
+      else if (!strict) line += ' — re-run with --strict to refuse';
+    } else {
+      line += ' into their product line.';
+    }
+    console.log(line);
+  }
   console.log('');
 
   const orderDateByPo = new Map(headers.map(h => [h.po_number, h.order_date]));
@@ -863,7 +901,14 @@ async function main(): Promise<void> {
     console.log('Done.');
     console.log(`Headers:         ${stats.headers.created} created, ${stats.headers.updated} updated, ${stats.headers.skipped} skipped`);
     console.log(`Lines:           ${stats.lines.inserted} inserted, ${stats.lines.deleted} deleted (replaced), ${stats.lines.skipped} skipped`);
-    console.log(`Packaging folds: ${stats.folds}`);
+    {
+      const failed = stats.foldFailures.nullRef + stats.foldFailures.unmatched;
+      let line = `Packaging folds: ${stats.folds}`;
+      if (failed > 0) {
+        line += ` (${failed} failed — ${round6(stats.foldFailures.costNotAllocated)} cost unallocated; see warnings/errors)`;
+      }
+      console.log(line);
+    }
     console.log(`sku_landed_cost: ${stats.skuLandedCost.inserted} inserted, ${stats.skuLandedCost.updated} updated, ${stats.skuLandedCost.skippedOlder} skipped (older PO)`);
     if (stats.warnings.length) {
       console.log('');
