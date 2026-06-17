@@ -430,6 +430,12 @@ async function main(): Promise<void> {
       `${result.tasksNoData} (asin, period) tuple(s) returned no data (FATAL/CANCELLED — logged to meta.sync_log), ` +
       `${result.totalRows} rows upserted across ${marketplaceIds.length} marketplace(s), ${result.periodCount} period(s), ${result.asinCount} ASIN(s).`,
     );
+    if (result.tasksFailed > 0) {
+      console.warn(
+        `  ${result.tasksFailed} task(s) still failed after one retry (usually a transient Amazon report-queue backlog). ` +
+        `Re-run the same command with --skip-existing to pick them up.`,
+      );
+    }
   } finally {
     try { await pg.end(); } catch { /* may already be ended by recent eviction */ }
   }
