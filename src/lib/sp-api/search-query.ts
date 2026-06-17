@@ -396,6 +396,7 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
   tasksRun: number;
   tasksSkipped: number;
   tasksNoData: number;        // (asin, period, marketplace) tuples Amazon returned FATAL/CANCELLED for
+  tasksFailed: number;        // tasks that errored (e.g. report-queue timeout) AND failed the one retry
   totalRows: number;
   pg: PgClient;
 }> {
@@ -427,17 +428,16 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
   const tasksSkipped = allTasks.length - tasks.length;
 
   if (tasks.length === 0) {
-    return { periodCount: periods.length, asinCount: opts.asins.length, tasksRun: 0, tasksSkipped, tasksNoData: 0, totalRows: 0, pg: opts.pg };
+    return { periodCount: periods.length, asinCount: opts.asins.length, tasksRun: 0, tasksSkipped, tasksNoData: 0, tasksFailed: 0, totalRows: 0, pg: opts.pg };
   }
 
   let activePg: PgClient = opts.pg;
   let totalRows = 0;
   let done = 0;
   let tasksNoData = 0;
+  const failures: Task[] = [];
 
-  for (const t of tasks) {
-    const period = periods.find((p) => p.start.toISOString().slice(0, 10) === t.periodStartIso)!;
-
+  const runTask = async (t: Task, period: { start: Date; end: Date }): Promise<number> => {
     const { rowsUpserted, skipped } = await ingestSqpPeriod({
       spClient: opts.spClient,
       pg: activePg,
@@ -449,9 +449,25 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
       periodStart: period.start,
       periodEnd: period.end,
     });
-
     totalRows += rowsUpserted;
     if (skipped) tasksNoData++;
+    return rowsUpserted;
+  };
+
+  for (const t of tasks) {
+    const period = periods.find((p) => p.start.toISOString().slice(0, 10) === t.periodStartIso)!;
+
+    let rowsUpserted = 0;
+    try {
+      rowsUpserted = await runTask(t, period);
+    } catch (err) {
+      // A single slow/queued report (e.g. an SQP IN_QUEUE timeout) must NOT abort
+      // the whole multi-hour backfill. Log it, queue it for one end-of-run retry,
+      // and carry on with the remaining tasks.
+      failures.push(t);
+      console.warn(`[sqp] task FAILED (${t.periodStartIso} ${t.marketplaceId} ${t.asin}): ${(err as Error).message} — continuing`);
+    }
+
     done++;
     opts.onProgress?.({
       periodStart: period.start.toISOString().slice(0, 10),
@@ -468,12 +484,31 @@ export async function backfillSqp(opts: BackfillSqpOptions): Promise<{
     }
   }
 
+  // One end-of-run retry pass for tasks that errored (usually a transient Amazon
+  // report-queue backlog). Still-failing tasks are reported, not thrown;
+  // --skip-existing means a later re-run will pick them up too.
+  let tasksFailed = 0;
+  if (failures.length > 0) {
+    console.warn(`[sqp] retrying ${failures.length} failed task(s) once...`);
+    for (const t of [...failures]) {
+      const period = periods.find((p) => p.start.toISOString().slice(0, 10) === t.periodStartIso)!;
+      activePg = await sleepWithKeepalive(effectiveDelay, activePg);
+      try {
+        await runTask(t, period);
+      } catch (err) {
+        tasksFailed++;
+        console.warn(`[sqp] retry STILL FAILED (${t.periodStartIso} ${t.marketplaceId} ${t.asin}): ${(err as Error).message}`);
+      }
+    }
+  }
+
   return {
     periodCount: periods.length,
     asinCount: opts.asins.length,
     tasksRun: tasks.length,
     tasksSkipped,
     tasksNoData,
+    tasksFailed,
     totalRows,
     pg: activePg,
   };
