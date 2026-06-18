@@ -75,7 +75,8 @@
     "check:migrations": "tsx src/cli/check-migrations.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "eslint src/ --ext .ts"
+    "lint": "eslint src/ --ext .ts",
+    "test": "node --import tsx --test tests/unit/**/*.test.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
