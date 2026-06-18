@@ -42,47 +42,98 @@ import { listReports, fetchReportDocument, parseTsv, type ListedReport } from '.
 const SETTLEMENT_REPORT_TYPE = 'GET_V2_SETTLEMENT_REPORT_DATA_FLAT_FILE_V2';
 
 /**
- * Settlement reports use locale-specific number formatting:
- *   UK / GBP reports:  `1,234.56`  (UK convention, parseable by Number())
- *   DE / EUR reports:  `1.234,56`  (German convention, NOT parseable by Number())
- *   Plain integers:    `1234`      (always parseable)
- *
- * Try UK/US first; on NaN, swap separators and retry. Empty / unparseable
- * returns null. Note: a pure-comma value like `1234,56` is unambiguously
- * European; a pure-dot value like `1234.56` is unambiguously UK/US. The
- * mixed cases (`1,234.56` vs `1.234,56`) disambiguate by which separator
- * appears LAST — the last separator is always the decimal point in both
- * conventions.
+ * Number-format locale for a settlement report. UK = `1,234.56` (comma
+ * thousands, dot decimal); EU = `1.234,56` (dot thousands, comma decimal).
+ * 'unknown' means the report's currency wasn't mapped — parser falls back
+ * to last-separator heuristic with a warning.
  */
-function parseNumeric(v: string | undefined): number | null {
-  if (v === undefined || v === '') return null;
+export type NumericLocale = 'uk' | 'eu' | 'unknown';
+
+/**
+ * Map a settlement's currencyCode to the expected number-format locale.
+ * Exported for the test fixtures. Add new currencies as RW expands.
+ *
+ * GBP/USD/CAD/MXN/AUD/SGD/JPY/etc use UK-style (comma thousands, dot decimal).
+ * EUR and other CE-European currencies use EU-style (dot thousands, comma
+ * decimal — empirically confirmed for EUR settlements,
+ * [[amazon-sp-api-format-quirks]]).
+ */
+export function localeForCurrency(currency: string | null | undefined): NumericLocale {
+  if (!currency) return 'unknown';
+  const c = currency.toUpperCase();
+  if (['GBP', 'USD', 'CAD', 'MXN', 'AUD', 'SGD', 'INR', 'JPY', 'BRL', 'AED', 'EGP'].includes(c)) return 'uk';
+  if (['EUR', 'SEK', 'PLN', 'NOK', 'DKK', 'CZK', 'HUF', 'RON', 'BGN', 'HRK', 'TRY'].includes(c)) return 'eu';
+  return 'unknown';
+}
+
+/**
+ * Parse a settlement-report numeric, using the report's currency-derived
+ * locale to disambiguate the previously-corruption-prone cases.
+ *
+ * Old heuristic-only parser silently corrupted the ambiguous "1,234" case:
+ * in a UK report that's £1234, in an EU report it's €1.234, and the old
+ * code unconditionally treated comma as decimal — so any UK comma-thousands
+ * value silently lost 1000×. Flagged by project review 2026-06-15 as
+ * Tier 1 #1.
+ *
+ * Rules:
+ *   - Dot-only / no separator: direct parse, locale-independent.
+ *   - Both separators: last separator is decimal (true in both UK and EU
+ *     formats — the difference is which character is thousands). Locale
+ *     used only for a consistency warning when the value's shape
+ *     contradicts the declared locale.
+ *   - Comma-only: locale decides. With 'uk', comma is thousands. With 'eu',
+ *     comma is decimal. With 'unknown', fall back to the old
+ *     "comma = decimal" heuristic AND emit a console.warn so it surfaces
+ *     in the daily-sync log — operator can then add the currency to
+ *     localeForCurrency() to remove the warning.
+ *
+ * Returns null for empty / unparseable input. Never returns NaN.
+ */
+export function parseNumeric(
+  v: string | undefined | null,
+  locale: NumericLocale = 'unknown',
+): number | null {
+  if (v === undefined || v === null || v === '') return null;
 
   const hasDot = v.includes('.');
   const hasComma = v.includes(',');
 
-  // Pick by which separator is the last one in the string.
   if (hasDot && hasComma) {
-    const lastDot = v.lastIndexOf('.');
-    const lastComma = v.lastIndexOf(',');
-    if (lastComma > lastDot) {
-      // European: . is thousands, , is decimal → 1.234,56 → 1234.56
-      const n = Number(v.replace(/\./g, '').replace(',', '.'));
-      return Number.isFinite(n) ? n : null;
+    const looksEu = v.lastIndexOf(',') > v.lastIndexOf('.');
+    if (locale !== 'unknown' && ((looksEu && locale === 'uk') || (!looksEu && locale === 'eu'))) {
+      console.warn(
+        `[settlements] mixed-separator value "${v}" looks ${looksEu ? 'EU' : 'UK'}-format ` +
+        `but report locale is ${locale.toUpperCase()} — parsing per the value's apparent format, ` +
+        `but worth investigating.`,
+      );
     }
-    // UK/US: , is thousands, . is decimal → 1,234.56 → 1234.56
-    const n = Number(v.replace(/,/g, ''));
+    const n = looksEu
+      ? Number(v.replace(/\./g, '').replace(',', '.'))
+      : Number(v.replace(/,/g, ''));
     return Number.isFinite(n) ? n : null;
   }
 
   if (hasComma) {
-    // Comma-only: ambiguous (could be 1,234 = 1234 UK or 1,234 = 1.234 EU).
-    // Amazon settlement TSVs never use comma as a thousands separator
-    // without a decimal point following, so treat comma as decimal.
+    if (locale === 'eu') {
+      const n = Number(v.replace(',', '.'));
+      return Number.isFinite(n) ? n : null;
+    }
+    if (locale === 'uk') {
+      // In UK reports comma is always thousands. The old code's
+      // "treat comma as decimal" was the silent-corruption source.
+      const n = Number(v.replace(/,/g, ''));
+      return Number.isFinite(n) ? n : null;
+    }
+    console.warn(
+      `[settlements] comma-only value "${v}" with unknown locale — defaulting to ` +
+      `"comma is decimal" (legacy behaviour). Add the currency to localeForCurrency() ` +
+      `to remove this warning.`,
+    );
     const n = Number(v.replace(',', '.'));
     return Number.isFinite(n) ? n : null;
   }
 
-  // Dot-only or no separators: parseable directly.
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
@@ -250,6 +301,11 @@ export async function ingestSettlementsWindow(opts: IngestSettlementsOpts): Prom
     const settlementMarketplace =
       report.marketplaceIds?.[0] ?? opts.marketplaceIds[0]!;
     const currency = (headerRow.currency || '').toUpperCase().slice(0, 3);
+    // Locale for number parsing — derives from currency so EUR rows get
+    // EU-format treatment, GBP/USD/etc get UK-format. See parseNumeric +
+    // localeForCurrency above. The 'unknown' fallback emits a console.warn
+    // when a comma-only value can't be safely disambiguated.
+    const reportLocale = localeForCurrency(currency);
 
     // Header upsert
     await opts.pg.query(
@@ -273,7 +329,7 @@ export async function ingestSettlementsWindow(opts: IngestSettlementsOpts): Prom
         parseSettlementTimestamp(headerRow['settlement-start-date']),
         parseSettlementTimestamp(headerRow['settlement-end-date']),
         parseSettlementTimestamp(headerRow['deposit-date']),
-        parseNumeric(headerRow['total-amount']) ?? 0,
+        parseNumeric(headerRow['total-amount'], reportLocale) ?? 0,
         currency || 'GBP', // CHAR(3) NOT NULL — fall back if Amazon ever omits.
         rawId,
       ],
@@ -296,8 +352,11 @@ export async function ingestSettlementsWindow(opts: IngestSettlementsOpts): Prom
       const orderId = row['order-id'] || null;
       const sku = row.sku || null;
       const description = row['amount-description'] || null;
-      const amount = parseNumeric(row.amount);
+      // Per-line currency can differ from the settlement header currency
+      // (rare — e.g. cross-border fees). Use the line's own locale.
       const lineCurrency = (row.currency || currency || '').toUpperCase().slice(0, 3);
+      const lineLocale = lineCurrency === currency ? reportLocale : localeForCurrency(lineCurrency);
+      const amount = parseNumeric(row.amount, lineLocale);
 
       const lineHash = hashLine([
         settlementId,
@@ -348,7 +407,7 @@ export async function ingestSettlementsWindow(opts: IngestSettlementsOpts): Prom
       settlementId,
       marketplaceId: settlementMarketplace,
       depositDate: parseSettlementTimestamp(headerRow['deposit-date']),
-      totalAmount: parseNumeric(headerRow['total-amount']),
+      totalAmount: parseNumeric(headerRow['total-amount'], reportLocale),
       currencyCode: currency,
       lines: linesThisReport,
     });
