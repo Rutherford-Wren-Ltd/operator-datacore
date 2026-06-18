@@ -74,9 +74,71 @@ export interface ReportResult {
 }
 
 /**
+ * Poll the Reports API until processingStatus reaches DONE, with hard timeout
+ * + periodic stderr logs so a stuck report doesn't sit silent for an hour.
+ *
+ * Tier 2 from project review (2026-06-15) — the previous polling shape was
+ * `for (let i = 0; i < 60; i++) await sleep(min(waitMs, 60_000))` with waitMs
+ * growing 1.5×; in steady state it spent ~53 iterations × 60s = ~53 min in
+ * silent waiting before throwing a generic timeout. Operator had no way to
+ * tell a slow report apart from a stuck pipeline. The new shape:
+ *
+ *   - hard cap: 30 min (configurable per caller; raise for known-slow reports)
+ *   - periodic log: every 5 min so progress is visible in CI / oncall console
+ *   - same exponential backoff inside the cap (5s → 60s)
+ *
+ * Throws ReportCancelledError / ReportFatalError on those statuses (caller
+ * decides whether to treat them as fatal). Throws a plain Error with elapsed
+ * time + last status when the timeout cap is hit.
+ */
+async function pollReportUntilDone(
+  client: SpApiClient,
+  opts: {
+    reportId: string;
+    reportType: string;
+    /** Hard wall-clock cap; default 30 min. */
+    maxWaitMs?: number;
+    /** Log cadence for "still IN_PROGRESS after Xm" stderr line; default 5 min. */
+    logEveryMs?: number;
+  },
+): Promise<GetReportResp> {
+  const maxWaitMs = opts.maxWaitMs ?? 30 * 60_000;
+  const logEveryMs = opts.logEveryMs ?? 5 * 60_000;
+  const startedAt = Date.now();
+  let nextLogAt = startedAt + logEveryMs;
+  let waitMs = 5_000;
+  const intervalCapMs = 60_000;
+  let meta: GetReportResp | undefined;
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    const got = await client.request<GetReportResp>({
+      method: 'GET',
+      path: `/reports/2021-06-30/reports/${opts.reportId}`,
+    });
+    meta = got.payload;
+    if (meta.processingStatus === 'DONE') return meta;
+    if (meta.processingStatus === 'CANCELLED') throw new ReportCancelledError(opts.reportId);
+    if (meta.processingStatus === 'FATAL') throw new ReportFatalError(opts.reportId);
+
+    if (Date.now() >= nextLogAt) {
+      const elapsedMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
+      console.error(`[reports] ${opts.reportType} report ${opts.reportId} still ${meta.processingStatus} after ${elapsedMin}m (cap ${maxWaitMs / 60_000}m)`);
+      nextLogAt = Date.now() + logEveryMs;
+    }
+
+    await sleep(Math.min(waitMs, intervalCapMs));
+    waitMs = Math.min(waitMs * 1.5, intervalCapMs);
+  }
+
+  throw new Error(
+    `Report ${opts.reportId} (${opts.reportType}) did not complete within ${maxWaitMs / 60_000}m. Last status: ${meta?.processingStatus ?? 'unknown'}`,
+  );
+}
+
+/**
  * End-to-end Reports API helper:
  *   1. createReport → reportId
- *   2. poll getReport until DONE (or CANCELLED/FATAL)
+ *   2. poll getReport until DONE (or CANCELLED/FATAL) — via pollReportUntilDone above
  *   3. getReportDocument → presigned URL
  *   4. fetch + decompress (if gzipped) → return raw text
  *
@@ -98,34 +160,15 @@ export async function runReport(client: SpApiClient, opts: RunReportOpts): Promi
   });
 
   const reportId = create.payload.reportId;
-  let meta: GetReportResp;
-  let waitMs = 5_000;
-  const maxWaitMs = 60_000;
+  const meta = await pollReportUntilDone(client, { reportId, reportType: opts.reportType });
 
-  for (let i = 0; i < 60; i++) {
-    const got = await client.request<GetReportResp>({
-      method: 'GET',
-      path: `/reports/2021-06-30/reports/${reportId}`,
-    });
-    meta = got.payload;
-    if (meta.processingStatus === 'DONE') break;
-    if (meta.processingStatus === 'CANCELLED') {
-      throw new ReportCancelledError(reportId);
-    }
-    if (meta.processingStatus === 'FATAL') {
-      throw new ReportFatalError(reportId);
-    }
-    await sleep(Math.min(waitMs, maxWaitMs));
-    waitMs = Math.min(waitMs * 1.5, maxWaitMs);
-  }
-
-  if (meta!.processingStatus !== 'DONE' || !meta!.reportDocumentId) {
-    throw new Error(`Report ${reportId} did not complete in time. Status: ${meta!.processingStatus}`);
+  if (!meta.reportDocumentId) {
+    throw new Error(`Report ${reportId} reached DONE but has no reportDocumentId`);
   }
 
   const doc = await client.request<GetReportDocumentResp>({
     method: 'GET',
-    path: `/reports/2021-06-30/documents/${meta!.reportDocumentId}`,
+    path: `/reports/2021-06-30/documents/${meta.reportDocumentId}`,
   });
 
   const fetched = await fetch(doc.payload.url);
@@ -136,7 +179,7 @@ export async function runReport(client: SpApiClient, opts: RunReportOpts): Promi
   const rawText =
     doc.payload.compressionAlgorithm === 'GZIP' ? gunzipSync(buf).toString('utf8') : buf.toString('utf8');
 
-  return { meta: meta!, rawText };
+  return { meta, rawText };
 }
 
 /**
@@ -168,34 +211,15 @@ export async function downloadReportToFile(
   });
 
   const reportId = create.payload.reportId;
-  let meta: GetReportResp;
-  let waitMs = 5_000;
-  const maxWaitMs = 60_000;
+  const meta = await pollReportUntilDone(client, { reportId, reportType: opts.reportType });
 
-  for (let i = 0; i < 60; i++) {
-    const got = await client.request<GetReportResp>({
-      method: 'GET',
-      path: `/reports/2021-06-30/reports/${reportId}`,
-    });
-    meta = got.payload;
-    if (meta.processingStatus === 'DONE') break;
-    if (meta.processingStatus === 'CANCELLED') {
-      throw new ReportCancelledError(reportId);
-    }
-    if (meta.processingStatus === 'FATAL') {
-      throw new ReportFatalError(reportId);
-    }
-    await sleep(Math.min(waitMs, maxWaitMs));
-    waitMs = Math.min(waitMs * 1.5, maxWaitMs);
-  }
-
-  if (meta!.processingStatus !== 'DONE' || !meta!.reportDocumentId) {
-    throw new Error(`Report ${reportId} did not complete in time. Status: ${meta!.processingStatus}`);
+  if (!meta.reportDocumentId) {
+    throw new Error(`Report ${reportId} reached DONE but has no reportDocumentId`);
   }
 
   const doc = await client.request<GetReportDocumentResp>({
     method: 'GET',
-    path: `/reports/2021-06-30/documents/${meta!.reportDocumentId}`,
+    path: `/reports/2021-06-30/documents/${meta.reportDocumentId}`,
   });
 
   const fetched = await fetch(doc.payload.url);
@@ -214,7 +238,7 @@ export async function downloadReportToFile(
     await pipeline(nodeStream, createWriteStream(filePath));
   }
 
-  return { meta: meta!, bytesWritten: statSync(filePath).size };
+  return { meta, bytesWritten: statSync(filePath).size };
 }
 
 /**
@@ -249,34 +273,15 @@ export async function streamReport(client: SpApiClient, opts: RunReportOpts): Pr
   });
 
   const reportId = create.payload.reportId;
-  let meta: GetReportResp;
-  let waitMs = 5_000;
-  const maxWaitMs = 60_000;
+  const meta = await pollReportUntilDone(client, { reportId, reportType: opts.reportType });
 
-  for (let i = 0; i < 60; i++) {
-    const got = await client.request<GetReportResp>({
-      method: 'GET',
-      path: `/reports/2021-06-30/reports/${reportId}`,
-    });
-    meta = got.payload;
-    if (meta.processingStatus === 'DONE') break;
-    if (meta.processingStatus === 'CANCELLED') {
-      throw new ReportCancelledError(reportId);
-    }
-    if (meta.processingStatus === 'FATAL') {
-      throw new ReportFatalError(reportId);
-    }
-    await sleep(Math.min(waitMs, maxWaitMs));
-    waitMs = Math.min(waitMs * 1.5, maxWaitMs);
-  }
-
-  if (meta!.processingStatus !== 'DONE' || !meta!.reportDocumentId) {
-    throw new Error(`Report ${reportId} did not complete in time. Status: ${meta!.processingStatus}`);
+  if (!meta.reportDocumentId) {
+    throw new Error(`Report ${reportId} reached DONE but has no reportDocumentId`);
   }
 
   const doc = await client.request<GetReportDocumentResp>({
     method: 'GET',
-    path: `/reports/2021-06-30/documents/${meta!.reportDocumentId}`,
+    path: `/reports/2021-06-30/documents/${meta.reportDocumentId}`,
   });
 
   const fetched = await fetch(doc.payload.url);
@@ -292,7 +297,7 @@ export async function streamReport(client: SpApiClient, opts: RunReportOpts): Pr
   const stream: NodeJS.ReadableStream =
     doc.payload.compressionAlgorithm === 'GZIP' ? nodeStream.pipe(createGunzip()) : nodeStream;
 
-  return { meta: meta!, stream };
+  return { meta, stream };
 }
 
 /**
