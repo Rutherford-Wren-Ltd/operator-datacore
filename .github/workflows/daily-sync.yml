@@ -373,6 +373,33 @@ jobs:
           fi
           npm run ingest-storage-fees
 
+      - name: Pull FBA inventory age (EU + NA, weekly)
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+          SP_API_REGION: ${{ secrets.SP_API_REGION }}
+          SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+          SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
+        run: |
+          # Inventory age is a slow-moving snapshot; weekly is plenty. Run on
+          # Mondays (UTC) on the schedule, OR any time the workflow is triggered
+          # manually (workflow_dispatch) so an operator can pull on demand.
+          # Idempotent upsert keyed by snapshot_date makes extra runs safe.
+          # %u gives 1=Mon .. 7=Sun. GITHUB_EVENT_NAME is set by the runner.
+          DOW=$(date -u +%u)
+          if [ "$DOW" -ne 1 ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "Day-of-week $DOW is not Monday and not a manual run; skipping inventory-age pull."
+            exit 0
+          fi
+          npm run ingest-inventory-age
+
       # Dead-man's-switch: queries meta.sync_freshness (migration 0037) and
       # exits non-zero if any object's hours_since_last_success exceeds its
       # inline per-object cadence (orders/sales-traffic/finances/settlements
