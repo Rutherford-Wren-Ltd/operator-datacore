@@ -14,6 +14,7 @@ import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { snapshotFbaInventory } from '../lib/sp-api/inventory.js';
+import { withSyncRun } from '../lib/sync-run.js';
 
 async function main(): Promise<void> {
   const { values } = parseArgs({
@@ -56,60 +57,57 @@ async function main(): Promise<void> {
     );
     const connectionId = connRows[0]!.connection_id;
 
-    // mode='incremental' — meta.sync_run check constraint accepts
-    // backfill | incremental | manual | verification.
-    const { rows: runRows } = await pg.query<{ sync_run_id: string }>(
-      `INSERT INTO meta.sync_run (connection_id, source, object, mode, window_start, window_end)
-       VALUES ($1, 'amazon_sp_api', 'fba_inventory_snapshot', 'incremental', NOW(), NOW())
-       RETURNING sync_run_id`,
-      [connectionId],
-    );
-    const syncRunId = runRows[0]!.sync_run_id;
+    // Wrap the work in withSyncRun() so a thrown exception inside the body
+    // marks the sync_run row as 'failed' rather than leaving it stuck at
+    // 'running' forever (the bug-pattern migration 0037 cleaned up
+    // retroactively). mode='incremental' — meta.sync_run check constraint
+    // accepts backfill | incremental | manual | verification.
+    await withSyncRun(pg, {
+      connectionId,
+      source: 'amazon_sp_api',
+      object: 'fba_inventory_snapshot',
+      mode: 'incremental',
+      windowStart: new Date(),
+      windowEnd: new Date(),
+    }, async (run) => {
+      const startedAt = Date.now();
+      let totalRows = 0;
+      let totalSkipped = 0;
+      for (const marketplaceId of regionConfig.marketplaceIds) {
+        console.log(`Marketplace ${marketplaceId}:`);
+        const result = await snapshotFbaInventory({
+          spClient,
+          pg,
+          marketplaceId,
+          onPage: (info) => {
+            console.log(
+              `  page ${info.page}: ${info.rowsFetched} SKUs from API ` +
+              `(written ${info.cumulativeRows}, skipped ${info.cumulativeSkipped} zero-inventory)`,
+            );
+          },
+        });
+        totalRows += result.totalRows;
+        totalSkipped += result.skipped;
+        const total = result.totalRows + result.skipped;
+        const pct = total > 0 ? ((result.skipped / total) * 100).toFixed(1) : '0.0';
+        console.log(
+          `  done: ${result.totalRows} SKUs written, ${result.skipped} skipped (${pct}% zero-inventory) ` +
+          `across ${result.pages} page(s) for snapshot_date ${result.snapshotDate}`,
+        );
+      }
 
-    const startedAt = Date.now();
-    let totalRows = 0;
+      run.setRowsFetched(totalRows);
+      run.setRowsUpserted(totalRows);
 
-    let totalSkipped = 0;
-    for (const marketplaceId of regionConfig.marketplaceIds) {
-      console.log(`Marketplace ${marketplaceId}:`);
-      const result = await snapshotFbaInventory({
-        spClient,
-        pg,
-        marketplaceId,
-        onPage: (info) => {
-          console.log(
-            `  page ${info.page}: ${info.rowsFetched} SKUs from API ` +
-            `(written ${info.cumulativeRows}, skipped ${info.cumulativeSkipped} zero-inventory)`,
-          );
-        },
-      });
-      totalRows += result.totalRows;
-      totalSkipped += result.skipped;
-      const total = result.totalRows + result.skipped;
-      const pct = total > 0 ? ((result.skipped / total) * 100).toFixed(1) : '0.0';
+      const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
+      console.log('');
+      const totalSeen = totalRows + totalSkipped;
+      const pct = totalSeen > 0 ? ((totalSkipped / totalSeen) * 100).toFixed(1) : '0.0';
       console.log(
-        `  done: ${result.totalRows} SKUs written, ${result.skipped} skipped (${pct}% zero-inventory) ` +
-        `across ${result.pages} page(s) for snapshot_date ${result.snapshotDate}`,
+        `Done in ${durationSec}s. ${totalRows} SKU snapshots written, ` +
+        `${totalSkipped} skipped as zero-inventory (${pct}% of ${totalSeen} seen).`,
       );
-    }
-
-    const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
-
-    await pg.query(
-      `UPDATE meta.sync_run
-         SET finished_at = NOW(), status = 'success',
-             rows_fetched = $2, rows_upserted = $2
-       WHERE sync_run_id = $1`,
-      [syncRunId, totalRows],
-    );
-
-    console.log('');
-    const totalSeen = totalRows + totalSkipped;
-    const pct = totalSeen > 0 ? ((totalSkipped / totalSeen) * 100).toFixed(1) : '0.0';
-    console.log(
-      `Done in ${durationSec}s. ${totalRows} SKU snapshots written, ` +
-      `${totalSkipped} skipped as zero-inventory (${pct}% of ${totalSeen} seen).`,
-    );
+    });
   } finally {
     await pg.end();
   }
