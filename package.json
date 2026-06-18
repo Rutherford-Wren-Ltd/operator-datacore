@@ -49,6 +49,7 @@
     "ingest-finances": "tsx src/cli/ingest-finances.ts",
     "ingest-settlements": "tsx src/cli/ingest-settlements.ts",
     "ingest-storage-fees": "tsx src/cli/ingest-storage-fees.ts",
+    "ingest-inventory-age": "tsx src/cli/ingest-inventory-age.ts",
     "sync-fx-rates": "tsx src/cli/sync-fx-rates.ts",
     "upload-secrets": "tsx src/cli/upload-secrets.ts",
     "import-masters": "tsx src/cli/import-masters.ts",
