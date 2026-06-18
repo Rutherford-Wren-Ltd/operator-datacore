@@ -220,7 +220,13 @@ function abs(n: number): number {
   return Math.abs(n);
 }
 
-function direction(n: number): 'credit' | 'debit' {
+/**
+ * Sign → direction mapping. Exported for the foundational test fixtures —
+ * inverting this (or even just changing the zero-case from credit to debit)
+ * would silently flip the meaning of every fee/charge in
+ * brain.financial_events and corrupt cash-position downstream.
+ */
+export function direction(n: number): 'credit' | 'debit' {
   return n >= 0 ? 'credit' : 'debit';
 }
 
