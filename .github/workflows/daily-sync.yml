@@ -331,23 +331,20 @@ jobs:
           # wide safety margin against missed days.
           npm run ingest-settlements -- --days 30
 
-      - name: Pull Settlements (NA)
-        # Run NA settlements even if EU settlements failed — the two regions
-        # share nothing operationally, so EU's failure shouldn't block NA's
-        # cash-position data. Other phase7 steps don't need this since orders
-        # / finances rarely fail; settlements occasionally hit per-marketplace
-        # transient issues (auth, report queue) where a retry on next sync
-        # is the right response.
-        if: always()
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
-          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
-          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
-        run: npm run ingest-settlements -- --region na --days 30
+      # Removed 2026-06-18 (PR triggered by project review).
+      # Previously: "Pull Settlements (NA)" — a redundant belt-and-braces ingest
+      # that failed 100% of runs with HTTP 403 from Amazon ("The marketplaces
+      # you provided are not valid for region"). Diagnosis found that the EU
+      # step above is already retrieving the full multi-region settlement set:
+      # Amazon's listReports endpoint is region-loose for this account, and
+      # the EU step's call returns settlements for US/CA/MX/BR alongside
+      # UK/DE/FR/IT/ES (confirmed via `raw.sp_api_report.marketplace_ids` over
+      # 2026-06-11 → 2026-06-17 — 8 marketplaces including ATVPDKIKX0DER all
+      # landing via the EU step alone). The NA step added zero data and one
+      # failed `meta.sync_run` row per workflow run. If a true region-isolated
+      # NA settlement ingest is wanted later as resilience, it needs a separate
+      # NA-issued LWA refresh token provisioned via Seller Central — track
+      # that as its own project rather than reviving this step.
 
       - name: Pull FBA storage fees (EU + NA, early/mid month)
         if: always()
@@ -375,3 +372,21 @@ jobs:
             exit 0
           fi
           npm run ingest-storage-fees
+
+      # Dead-man's-switch: queries meta.sync_freshness (migration 0037) and
+      # exits non-zero if any object's hours_since_last_success exceeds its
+      # inline per-object cadence (orders/sales-traffic/finances/settlements
+      # at 25h, weekly objects at 8d, monthly at 35d). The GitHub Actions
+      # email-on-failure becomes the single high-signal alert that replaces
+      # the previous per-step failure noise — added 2026-06-18 alongside the
+      # NA settlement step removal so the workflow goes from "consistently
+      # red with one known-benign failure" to "green unless something is
+      # actually stale".
+      - name: Verify sync freshness
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: npm run verify-sync-freshness
