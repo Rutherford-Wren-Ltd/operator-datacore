@@ -27,34 +27,7 @@ import { loadEnvForAmazonShared, getSpApiRegionConfig, type SpApiRegion } from '
 import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { backfillSalesTraffic } from '../lib/sp-api/sales-traffic.js';
-
-// Short-code aliases for the marketplace IDs Amazon assigns. Operator types
-// `--marketplaces UK,US`; we resolve to the canonical IDs. Raw IDs are also
-// accepted and pass through unchanged.
-const MARKETPLACE_ALIASES: Record<string, string> = {
-  US: 'ATVPDKIKX0DER',
-  CA: 'A2EUQ1WTGCTBG2',
-  MX: 'A1AM78C64UM0Y8',
-  UK: 'A1F83G8C2ARO7P',
-  GB: 'A1F83G8C2ARO7P',
-  DE: 'A1PA6795UKMFR9',
-  FR: 'A13V1IB3VIYZZH',
-  IT: 'APJ6JRA9NG5V4',
-  ES: 'A1RKKUPIHCS9HS',
-  NL: 'A1805IZSGTT6HS',
-  SE: 'A2NODRKZP88ZB9',
-  PL: 'A1C3SOZRARQ6R3',
-  TR: 'A33AVAJ2PDY3EV',
-  JP: 'A1VC38T7YXB528',
-};
-
-function resolveMarketplaceFilter(raw: string | undefined): string[] | null {
-  if (!raw) return null;
-  return raw.split(',').map((s) => s.trim()).filter(Boolean).map((tok) => {
-    const upper = tok.toUpperCase();
-    return MARKETPLACE_ALIASES[upper] ?? tok;
-  });
-}
+import { resolveMarketplaceFilter } from '../lib/marketplaces.js';
 
 interface ParsedArgs {
   source: string;

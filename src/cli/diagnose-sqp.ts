@@ -46,9 +46,7 @@ interface GetReportDocumentResp {
   compressionAlgorithm?: 'GZIP';
 }
 
-const MARKETPLACE_ALIASES: Record<string, string> = {
-  US: 'ATVPDKIKX0DER', UK: 'A1F83G8C2ARO7P', GB: 'A1F83G8C2ARO7P',
-};
+import { MARKETPLACE_ALIASES } from '../lib/marketplaces.js';
 
 function monthBoundary(d: Date): { start: Date; end: Date } {
   const start = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1));
