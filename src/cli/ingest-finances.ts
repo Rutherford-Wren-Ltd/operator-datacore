@@ -32,6 +32,7 @@ import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { ingestFinancialEventsWindow } from '../lib/sp-api/finances.js';
 import { MARKETPLACE_ALIASES } from '../lib/marketplaces.js';
+import { withSyncRun } from '../lib/sync-run.js';
 
 // Single-value variant of resolveMarketplaceFilter — ingest-finances takes a
 // single --marketplace-tag flag, not a comma-separated list. Different
@@ -130,46 +131,45 @@ async function main(): Promise<void> {
     );
     const connectionId = connRows[0]!.connection_id;
 
-    const { rows: runRows } = await pg.query<{ sync_run_id: string }>(
-      `INSERT INTO meta.sync_run (connection_id, source, object, mode, window_start, window_end)
-       VALUES ($1, 'amazon_sp_api', 'financial_events', 'backfill', $2, $3)
-       RETURNING sync_run_id`,
-      [connectionId, fromDate.toISOString(), toDate.toISOString()],
-    );
-    const syncRunId = runRows[0]!.sync_run_id;
-
-    const startedAt = Date.now();
-    const result = await ingestFinancialEventsWindow({
-      spClient,
-      pg,
+    // withSyncRun (PR #102) finalises the sync_run row on both success AND
+    // failure paths — preventing the 'running'-forever zombies migration 0037
+    // had to clean up retroactively.
+    await withSyncRun(pg, {
       connectionId,
-      syncRunId,
-      marketplaceIds: [marketplaceTag],
-      marketplaceTag,
-      postedAfter: fromDate,
-      postedBefore: toDate,
+      source: 'amazon_sp_api',
+      object: 'financial_events',
+      mode: 'backfill',
+      windowStart: fromDate,
+      windowEnd: toDate,
+    }, async (run) => {
+      const startedAt = Date.now();
+      const result = await ingestFinancialEventsWindow({
+        spClient,
+        pg,
+        connectionId,
+        syncRunId: run.syncRunId,
+        marketplaceIds: [marketplaceTag],
+        marketplaceTag,
+        postedAfter: fromDate,
+        postedBefore: toDate,
+      });
+
+      run.setRowsFetched(result.rowsParsed);
+      run.setRowsUpserted(result.rowsUpserted);
+
+      const durationMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
+      console.log('');
+      console.log(
+        `Done in ${durationMin} min. ${result.pagesFetched} page(s), ` +
+        `${result.rowsParsed} row(s) parsed, ${result.rowsUpserted} upserted, ` +
+        `${result.rowsSkippedDuplicate} skipped (already present).`,
+      );
+      console.log('');
+      console.log('By event type:');
+      for (const [et, n] of Object.entries(result.byEventType).sort((a, b) => b[1] - a[1])) {
+        console.log(`  ${et.padEnd(28)} ${String(n).padStart(6)} row(s)`);
+      }
     });
-
-    await pg.query(
-      `UPDATE meta.sync_run
-         SET finished_at = NOW(), status = 'success',
-             rows_fetched = $2, rows_upserted = $3
-       WHERE sync_run_id = $1`,
-      [syncRunId, result.rowsParsed, result.rowsUpserted],
-    );
-
-    const durationMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
-    console.log('');
-    console.log(
-      `Done in ${durationMin} min. ${result.pagesFetched} page(s), ` +
-      `${result.rowsParsed} row(s) parsed, ${result.rowsUpserted} upserted, ` +
-      `${result.rowsSkippedDuplicate} skipped (already present).`,
-    );
-    console.log('');
-    console.log('By event type:');
-    for (const [et, n] of Object.entries(result.byEventType).sort((a, b) => b[1] - a[1])) {
-      console.log(`  ${et.padEnd(28)} ${String(n).padStart(6)} row(s)`);
-    }
   } finally {
     try { await pg.end(); } catch { /* */ }
   }

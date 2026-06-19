@@ -30,6 +30,7 @@ import { getPgClient } from '../lib/supabase.js';
 import { SpApiClient } from '../lib/sp-api/client.js';
 import { ingestOrdersWindow } from '../lib/sp-api/orders.js';
 import { resolveMarketplaceFilter } from '../lib/marketplaces.js';
+import { withSyncRun } from '../lib/sync-run.js';
 
 const CHUNK_DAYS_DEFAULT = 30;
 
@@ -216,84 +217,84 @@ async function main(): Promise<void> {
     );
     const connectionId = connRows[0]!.connection_id;
 
-    const { rows: runRows } = await pg.query<{ sync_run_id: string }>(
-      `INSERT INTO meta.sync_run (connection_id, source, object, mode, window_start, window_end)
-       VALUES ($1, 'amazon_sp_api', 'orders_report', 'backfill', $2, $3)
-       RETURNING sync_run_id`,
-      [connectionId, fromDate.toISOString(), toDate.toISOString()],
-    );
-    const syncRunId = runRows[0]!.sync_run_id;
+    // withSyncRun (PR #102) finalises the sync_run row on both success AND
+    // failure paths. The setStatus('partial') call below handles the existing
+    // per-chunk failure-tolerant semantics: chunks fail individually, the
+    // run completes, status reflects whether any failed.
+    await withSyncRun(pg, {
+      connectionId,
+      source: 'amazon_sp_api',
+      object: 'orders_report',
+      mode: 'backfill',
+      windowStart: fromDate,
+      windowEnd: toDate,
+    }, async (run) => {
+      const completed = args.skipExisting
+        ? await loadCompletedChunks(pg, marketplaceIds, chunks)
+        : new Set<string>();
+      if (args.skipExisting) {
+        console.log(`  Skip set:      ${completed.size} (marketplace, chunk) pair(s) already in lake`);
+        console.log('');
+      }
 
-    const completed = args.skipExisting
-      ? await loadCompletedChunks(pg, marketplaceIds, chunks)
-      : new Set<string>();
-    if (args.skipExisting) {
-      console.log(`  Skip set:      ${completed.size} (marketplace, chunk) pair(s) already in lake`);
+      const startedAt = Date.now();
+      let totalOrders = 0;
+      let totalItems = 0;
+      let totalSkipped = 0;
+      let chunksRun = 0;
+      let chunksSkipped = 0;
+      const failures: Array<{ marketplace: string; chunk: string; error: string }> = [];
+
+      for (const mp of marketplaceIds) {
+        for (const c of chunks) {
+          const key = `${mp}|${c.start.toISOString().slice(0, 10)}|${c.end.toISOString().slice(0, 10)}`;
+          if (completed.has(key)) {
+            chunksSkipped += 1;
+            continue;
+          }
+          const label = `${mp} ${c.start.toISOString().slice(0, 10)} → ${c.end.toISOString().slice(0, 10)}`;
+          try {
+            const r = await ingestOrdersWindow({
+              spClient, pg,
+              connectionId, syncRunId: run.syncRunId,
+              marketplaceId: mp,
+              fromDate: c.start,
+              toDate: c.end,
+            });
+            totalOrders += r.ordersUpserted;
+            totalItems += r.itemsUpserted;
+            totalSkipped += r.rowsSkipped;
+            chunksRun += 1;
+            console.log(`  [${chunksRun}/${chunks.length * marketplaceIds.length - chunksSkipped}] ${label} → ${r.ordersUpserted} order(s), ${r.itemsUpserted} item(s)${r.rowsSkipped ? `, ${r.rowsSkipped} row(s) skipped (no SKU/ASIN)` : ''}`);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message.split('\n')[0]! : String(err);
+            console.error(`  [FAIL] ${label}: ${msg}`);
+            failures.push({ marketplace: mp, chunk: `${c.start.toISOString().slice(0, 10)}→${c.end.toISOString().slice(0, 10)}`, error: msg });
+          }
+        }
+      }
+
+      run.setRowsFetched(totalOrders + totalItems);
+      run.setRowsUpserted(totalOrders + totalItems);
+      if (failures.length > 0) run.setStatus('partial');
+
+      const durationMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
       console.log('');
-    }
+      console.log(
+        `Done in ${durationMin} min. ${chunksRun} chunk(s) run, ${chunksSkipped} skipped, ` +
+        `${failures.length} failed. ${totalOrders} order(s), ${totalItems} item(s) upserted` +
+        (totalSkipped ? `, ${totalSkipped} row(s) skipped (no SKU/ASIN).` : '.'),
+      );
 
-    const startedAt = Date.now();
-    let totalOrders = 0;
-    let totalItems = 0;
-    let totalSkipped = 0;
-    let chunksRun = 0;
-    let chunksSkipped = 0;
-    const failures: Array<{ marketplace: string; chunk: string; error: string }> = [];
-
-    for (const mp of marketplaceIds) {
-      for (const c of chunks) {
-        const key = `${mp}|${c.start.toISOString().slice(0, 10)}|${c.end.toISOString().slice(0, 10)}`;
-        if (completed.has(key)) {
-          chunksSkipped += 1;
-          continue;
+      if (failures.length > 0) {
+        console.error('');
+        console.error(`${failures.length} chunk(s) failed:`);
+        for (const f of failures) {
+          console.error(`  ${f.marketplace} ${f.chunk}: ${f.error}`);
         }
-        const label = `${mp} ${c.start.toISOString().slice(0, 10)} → ${c.end.toISOString().slice(0, 10)}`;
-        try {
-          const r = await ingestOrdersWindow({
-            spClient, pg,
-            connectionId, syncRunId,
-            marketplaceId: mp,
-            fromDate: c.start,
-            toDate: c.end,
-          });
-          totalOrders += r.ordersUpserted;
-          totalItems += r.itemsUpserted;
-          totalSkipped += r.rowsSkipped;
-          chunksRun += 1;
-          console.log(`  [${chunksRun}/${chunks.length * marketplaceIds.length - chunksSkipped}] ${label} → ${r.ordersUpserted} order(s), ${r.itemsUpserted} item(s)${r.rowsSkipped ? `, ${r.rowsSkipped} row(s) skipped (no SKU/ASIN)` : ''}`);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message.split('\n')[0]! : String(err);
-          console.error(`  [FAIL] ${label}: ${msg}`);
-          failures.push({ marketplace: mp, chunk: `${c.start.toISOString().slice(0, 10)}→${c.end.toISOString().slice(0, 10)}`, error: msg });
-        }
+        process.exitCode = 1;
       }
-    }
-
-    await pg.query(
-      `UPDATE meta.sync_run
-         SET finished_at = NOW(), status = $2,
-             rows_fetched = $3, rows_upserted = $4
-       WHERE sync_run_id = $1`,
-      [syncRunId, failures.length === 0 ? 'success' : 'partial',
-       totalOrders + totalItems, totalOrders + totalItems],
-    );
-
-    const durationMin = ((Date.now() - startedAt) / 60_000).toFixed(1);
-    console.log('');
-    console.log(
-      `Done in ${durationMin} min. ${chunksRun} chunk(s) run, ${chunksSkipped} skipped, ` +
-      `${failures.length} failed. ${totalOrders} order(s), ${totalItems} item(s) upserted` +
-      (totalSkipped ? `, ${totalSkipped} row(s) skipped (no SKU/ASIN).` : '.'),
-    );
-
-    if (failures.length > 0) {
-      console.error('');
-      console.error(`${failures.length} chunk(s) failed:`);
-      for (const f of failures) {
-        console.error(`  ${f.marketplace} ${f.chunk}: ${f.error}`);
-      }
-      process.exitCode = 1;
-    }
+    });
   } finally {
     try { await pg.end(); } catch { /* */ }
   }
