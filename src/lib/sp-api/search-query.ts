@@ -168,6 +168,21 @@ export async function ingestSqpPeriod(opts: IngestSqpPeriodOptions): Promise<{
             }),
           ],
         );
+        // Persistent marker (migration 0046) so subsequent runs can skip this
+        // tuple without spending another minute per call discovering Amazon
+        // still has no data. fail_count increments on repeat hits — operator
+        // can DELETE markers if they want to recheck tuples Amazon may have
+        // caught up on, or pass --retry-fatals to bypass the filter entirely.
+        await opts.pg.query(
+          `INSERT INTO meta.report_fatal_marker
+             (object, marketplace_id, asin, period_type, period_start, reason)
+           VALUES ('search_query_performance_report', $1, $2, $3, $4, $5)
+           ON CONFLICT (object, marketplace_id, asin, period_type, period_start) DO UPDATE
+             SET last_seen_at = NOW(),
+                 fail_count = meta.report_fatal_marker.fail_count + 1,
+                 reason = EXCLUDED.reason`,
+          [opts.marketplaceId, opts.asin, opts.periodType, periodStartStr, reason],
+        );
         return { rowsUpserted: 0, skipped: reason };
       }
       throw err;
