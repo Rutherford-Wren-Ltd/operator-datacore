@@ -78,6 +78,7 @@ interface ParsedArgs {
   topN: number | null;              // --top-n 50 — picks top N ASINs by recent units sold from sales_traffic
   delayMs: number;
   skipExisting: boolean;
+  retryFatals: boolean;
   dryRun: boolean;
 }
 
@@ -97,6 +98,15 @@ function parseCliArgs(): ParsedArgs {
       'top-n':       { type: 'string' },                       // pick top-N by 30d units
       delay:         { type: 'string', default: '60000' },
       'skip-existing': { type: 'boolean', default: false },
+      // --retry-fatals: bypass the meta.report_fatal_marker filter (migration
+      // 0046). Default behaviour is to skip (asin, marketplace, period) tuples
+      // Amazon previously returned FATAL/CANCELLED for — saves ~60s/call on
+      // tuples that are structurally unreachable (pre-launch periods, US
+      // monthly reports Amazon hasn't published yet). Pass this flag when you
+      // want to re-attempt those tuples (e.g. an ASIN that was previously
+      // pre-launch may now have data). Operator can also DELETE specific
+      // markers via SQL for finer-grained re-attempts.
+      'retry-fatals': { type: 'boolean', default: false },
       'dry-run':     { type: 'boolean', default: false },
     },
   });
@@ -157,6 +167,7 @@ function parseCliArgs(): ParsedArgs {
     topN,
     delayMs: parseInt(values.delay!, 10),
     skipExisting: values['skip-existing'] ?? false,
+    retryFatals: values['retry-fatals'] ?? false,
     dryRun: values['dry-run'] ?? false,
   };
 }
@@ -226,6 +237,44 @@ async function loadExistingKeys(
             to_char(period_start, 'YYYY-MM-DD') AS period_start
        FROM brain.search_query_performance
       WHERE period_type = $1
+        AND marketplace_id = ANY($2)
+        AND asin = ANY($3)
+        AND period_start BETWEEN $4 AND $5`,
+    [
+      periodType,
+      marketplaceIds,
+      asins,
+      fromDate.toISOString().slice(0, 10),
+      toDate.toISOString().slice(0, 10),
+    ],
+  );
+  const keys = new Set<string>();
+  for (const r of rows) {
+    keys.add(`${periodType}|${r.period_start}|${r.marketplace_id}|${r.asin}`);
+  }
+  return keys;
+}
+
+/**
+ * Load the set of (period, marketplace, asin) tuples Amazon has previously
+ * returned FATAL/CANCELLED for, so the backfill can skip them. Migration 0046
+ * created meta.report_fatal_marker; this query is the read side. Operator can
+ * bypass via --retry-fatals; this function isn't called in that case.
+ */
+async function loadFatalMarkers(
+  pg: import('pg').Client,
+  periodType: SqpPeriodType,
+  marketplaceIds: string[],
+  asins: string[],
+  fromDate: Date,
+  toDate: Date,
+): Promise<Set<string>> {
+  const { rows } = await pg.query<{ marketplace_id: string; asin: string; period_start: string }>(
+    `SELECT marketplace_id, asin,
+            to_char(period_start, 'YYYY-MM-DD') AS period_start
+       FROM meta.report_fatal_marker
+      WHERE object = 'search_query_performance_report'
+        AND period_type = $1
         AND marketplace_id = ANY($2)
         AND asin = ANY($3)
         AND period_start BETWEEN $4 AND $5`,
@@ -388,8 +437,25 @@ async function main(): Promise<void> {
     if (args.skipExisting) {
       existingKeys = await loadExistingKeys(pg, args.periodType, marketplaceIds, asins, fromDate, toDate);
       console.log(`  Skip set:      ${existingKeys.size} (period, marketplace, ASIN) tuple(s) already present`);
-      console.log('');
     }
+
+    // Load known-FATAL markers (migration 0046) unless --retry-fatals. Merged
+    // into the same existingKeys skip set the backfill loop already honours,
+    // so the marker set acts like "these tuples returned no data before, save
+    // ~60s/call by not asking again". --retry-fatals leaves the markers alone
+    // (the search-query side still writes a fresh marker if Amazon FATALs
+    // again, with fail_count incremented).
+    if (!args.retryFatals) {
+      const fatalKeys = await loadFatalMarkers(pg, args.periodType, marketplaceIds, asins, fromDate, toDate);
+      if (fatalKeys.size > 0) {
+        console.log(`  Fatal markers: ${fatalKeys.size} (period, marketplace, ASIN) tuple(s) previously returned FATAL/CANCELLED — skipping (pass --retry-fatals to recheck)`);
+        if (!existingKeys) existingKeys = new Set<string>();
+        for (const k of fatalKeys) existingKeys.add(k);
+      }
+    } else {
+      console.log(`  Retry fatals:  --retry-fatals set — known-FATAL tuples will be re-attempted`);
+    }
+    console.log('');
 
     checkpoint('before backfillSqp');
     const startedAt = Date.now();
