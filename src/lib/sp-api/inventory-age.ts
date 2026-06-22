@@ -24,7 +24,11 @@ import { Client as PgClient } from 'pg';
 import { SpApiClient } from './client.js';
 import { runReport, parseTsv, ReportCancelledError } from './reports.js';
 
-export const INVENTORY_AGE_REPORT_TYPE = 'GET_FBA_INVENTORY_AGED_DATA';
+// The FBA inventory-age buckets (inv-age-0-to-90-days .. 365-plus) and the
+// estimated storage / aged-inventory-surcharge columns live in the FBA
+// Inventory Planning / restock report. 'GET_FBA_INVENTORY_AGED_DATA' is NOT a
+// valid SP-API report type (it is accepted then returns FATAL).
+export const INVENTORY_AGE_REPORT_TYPE = 'GET_FBA_INVENTORY_PLANNING_DATA';
 
 /** Locale-aware numeric parse (UK 1,234.56 vs EU 1.234,56). Empty -> null. */
 function parseNumeric(v: string | undefined): number | null {
@@ -184,9 +188,10 @@ export async function ingestInventoryAge(opts: IngestInventoryAgeOpts): Promise<
     report = await runReport(opts.spClient, {
       reportType: INVENTORY_AGE_REPORT_TYPE,
       marketplaceIds: opts.marketplaceIds,
-      // Inventory-age is a point-in-time snapshot report; no data window needed,
-      // but pass asOf as dataEndTime for consistency with the report runner.
-      dataEndTime: opts.asOf,
+      // Inventory-age is a point-in-time snapshot report: request it with NO
+      // date window. Amazon rejects an endDate supplied without a startDate
+      // ("The endDate does not have a corresponding startDate") and returns the
+      // current snapshot when neither is given.
     });
   } catch (err) {
     if (err instanceof ReportCancelledError) return result;

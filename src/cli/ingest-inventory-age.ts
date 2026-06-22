@@ -92,7 +92,7 @@ async function main(): Promise<void> {
 
       const { rows: runRows } = await pg.query<{ sync_run_id: string }>(
         `INSERT INTO meta.sync_run (connection_id, source, object, mode, window_start, window_end)
-         VALUES ($1, 'amazon_sp_api', 'fba_inventory_age', 'snapshot', $2, NOW())
+         VALUES ($1, 'amazon_sp_api', 'fba_inventory_age', 'incremental', $2, NOW())
          RETURNING sync_run_id`,
         [connectionId, asOf.toISOString()],
       );
