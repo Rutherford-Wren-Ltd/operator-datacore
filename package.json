@@ -67,6 +67,7 @@
     "import-forecast": "tsx src/cli/import-forecast.ts",
     "cashflow-sync": "tsx src/cli/cashflow-sync.ts",
     "import-ads-console": "tsx src/cli/import-ads-console.ts",
+    "import-ads-entity-names": "tsx src/cli/import-ads-entity-names.ts",
     "build-po-template": "tsx src/cli/build-po-template.ts",
     "set-po-status": "tsx src/cli/set-po-status.ts",
     "generate-pos": "tsx src/cli/generate-pos.ts",
