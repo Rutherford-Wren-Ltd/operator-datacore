@@ -9,8 +9,9 @@
 //
 // These are DRAFT POs — never placed orders. The team reviews the report,
 // assigns physical destinations, allocates real PO numbers, and promotes each
-// PO they approve. Un-promoted engine drafts are deleted and regenerated on the
-// next run, so do not edit a draft in place — promote it first.
+// PO they approve. Un-promoted engine drafts are expired (archived, not deleted)
+// and regenerated on the next run, so do not edit a draft in place — promote it
+// first; an un-promoted edit survives as an 'expired' row but won't be acted on.
 //
 // Usage:
 //   npm run generate-pos
@@ -489,10 +490,19 @@ async function main(): Promise<void> {
         await pg.query('BEGIN');
         await pg.query(`SET LOCAL app.change_source = 'restock_engine:${syncRunId}'`);
 
-        // Idempotency: drop only the engine's own still-draft POs. POs the
-        // operator promoted out of draft are real now — left untouched.
+        // Idempotency: expire (don't delete) the engine's own still-draft POs,
+        // so any operator context on an un-promoted draft survives as an audit
+        // trail instead of vanishing every run. POs the operator promoted out of
+        // draft are real now — left untouched (WHERE status = 'draft'). We also
+        // suffix the archived po_number with a timestamp: po_number is UNIQUE, so
+        // freeing the clean base number (e.g. RX-SUP-016) lets this run's fresh
+        // draft reuse it without a collision.
         await pg.query(
-          "DELETE FROM brain.purchase_orders WHERE source_system = 'restock_engine' AND status = 'draft'",
+          `UPDATE brain.purchase_orders
+              SET status    = 'expired',
+                  po_number = po_number || '-exp-'
+                              || to_char(now() AT TIME ZONE 'UTC', 'YYYYMMDD"T"HH24MISS')
+            WHERE source_system = 'restock_engine' AND status = 'draft'`,
         );
 
         const suppliers = [...bySupplier.entries()]
@@ -698,8 +708,8 @@ function buildReport(d: ReportInput): string {
     + 'UK/EU and one for NA, depending on which region has a gap. Default destinations are '
     + 'pre-filled (`uk_eu`→`fba_direct`, `na`→`usa_awd`); flip a UK line to '
     + '`uk_3pl_lemonpath` at review if 3PL landing is preferred. Allocate a real PO '
-    + 'number and promote each PO you approve. Un-promoted engine drafts are deleted and '
-    + 'regenerated on the next run — promote a draft before editing it.');
+    + 'number and promote each PO you approve. Un-promoted engine drafts are expired '
+    + '(archived) and regenerated on the next run — promote a draft before editing it.');
   L.push('');
   if (d.dryRun) {
     L.push('> **DRY RUN** — no draft POs were written to the database. This report is a preview.');
@@ -821,7 +831,8 @@ function buildReport(d: ReportInput): string {
     + 'rather land at `uk_3pl_lemonpath`. Rename `po_number` to the real PO number, '
     + 'then promote with `npm run set-po-status`.');
   L.push('3. Anything you do **not** want regenerated next run must be promoted out of '
-    + '`draft` first — un-promoted engine drafts are deleted and rebuilt every run.');
+    + '`draft` first — un-promoted engine drafts are expired (archived to an `expired` '
+    + 'row) and rebuilt every run.');
   L.push('');
   L.push(`_Run ${d.syncRunId ?? '(dry-run)'} · generate-pos · operator-datacore_`);
   L.push('');
