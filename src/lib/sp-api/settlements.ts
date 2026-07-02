@@ -147,7 +147,7 @@ export function parseNumeric(
  * Falls through to verbatim pass-through for ISO 8601 inputs so the function
  * is safe if Amazon ever changes the format mid-cycle.
  */
-function parseSettlementTimestamp(v: string | undefined): string | null {
+export function parseSettlementTimestamp(v: string | undefined): string | null {
   if (v === undefined || v === '') return null;
   // Datetime: "20.05.2026 03:52:31 UTC" (with optional trailing zone label)
   const dt = v.match(/^(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2}):(\d{2})(?:\s+UTC)?$/);
