@@ -1,0 +1,58 @@
+name: Outcome check — Weekly
+
+# Closes the propose -> approve -> ship -> VERIFY loop. Reads ops.decision_log for
+# recommendations the operator shipped >= 21 days ago whose outcome is still
+# 'pending', measures what happened to the SKU (pre/post-ship units + revenue from
+# brain.sales_traffic_daily; ACoS from analytics.ads_per_asin_daily for ppc-audit
+# decisions), and writes outcome_status / outcome_note / outcome_checked_at.
+#
+# This is OBSERVED MOVEMENT, not causal attribution (season/price/stock move too) —
+# the note carries the raw numbers for a human to read. Reads/writes the lake only.
+# Idempotent: only 'pending' rows are touched. A week with no due decisions is a
+# clean no-op.
+#
+# Scheduling: 05:15 UTC Monday, after tariff (05:00), before the restock engine
+# (06:00). Manual: Actions -> "Outcome check — Weekly" -> Run workflow.
+
+on:
+  schedule:
+    - cron: '15 5 * * 1'   # Mondays 05:15 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write   # failure issue only
+
+jobs:
+  outcome-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify shipped decision outcomes
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          npm run outcome-check
+
+      - name: Open failure issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          gh issue create \
+            --title "Outcome check FAILED — ${DATE}" \
+            --body "The weekly decision-outcome verification failed. See logs: ${RUN_URL}. It reads/writes ops.decision_log only; a skipped week is safe (idempotent, re-runs pick up the same pending rows)."
