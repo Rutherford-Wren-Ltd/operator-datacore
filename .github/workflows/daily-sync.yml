@@ -83,8 +83,14 @@ jobs:
           FROM=$(date -u -d "${DAYS} days ago" +%F)
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} (concurrency 1, 8s delay between days)"
+          # --skip-existing: Amazon caps this report at 1 createReport/15min, so a
+          # 3-day × 5-marketplace window is 15 calls ≈ 3h45m — over the 180min job
+          # cap. Skipping (marketplace, day) pairs already in the lake keeps a normal
+          # daily run to ~5 calls (yesterday × markets). Missed days self-heal; a
+          # killed run resumes. Historical restatement re-pulls go via the separate
+          # sales-traffic-catchup workflow.
           npm run backfill -- --source amazon --report sales-traffic \
-            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000 --skip-existing
 
       - name: Pull Sales & Traffic (NA)
         env:
@@ -104,8 +110,10 @@ jobs:
           FROM=$(date -u -d "${DAYS} days ago" +%F)
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} for NA region"
+          # --skip-existing: see the EU step above — keeps the daily run inside the
+          # 180min job cap given Amazon's 1 createReport/15min limit.
           npm run backfill -- --source amazon --report sales-traffic --region na \
-            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000 --skip-existing
 
       - name: Roll up rollups
         env:
