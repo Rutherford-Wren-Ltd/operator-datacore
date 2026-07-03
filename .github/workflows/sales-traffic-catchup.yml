@@ -1,0 +1,81 @@
+name: Sales & Traffic Catch-up (EU history)
+
+# One-off / repeating HISTORICAL backfill of GET_SALES_AND_TRAFFIC_REPORT for the
+# EU marketplaces into brain.sales_traffic_daily. Runs on GitHub's cloud runners,
+# so it advances whether or not any laptop is on, asleep, or shut down.
+#
+# WHY A SEPARATE WORKFLOW (not daily-sync):
+#   Amazon throttles this report to 1 createReport call per 15 minutes, app-wide
+#   (enforced in src/lib/sp-api/sales-traffic.ts — --delay is clamped up to
+#   900000ms). A single GitHub Actions job is capped at 6h, so one run can make
+#   only ~20 calls (~20 marketplace-days). This workflow is therefore built to
+#   RESUME: every run re-issues the same --from/--to with --skip-existing, so it
+#   skips days already landed and continues where the previous run stopped.
+#   Trigger it repeatedly (manually, or via the optional schedule below) until
+#   the window is full; once complete, further runs are cheap no-ops.
+#
+# DURATION IS SET BY AMAZON'S QUOTA, NOT THE HOST:
+#   ~96 calls/day max => a 12-month x 4-marketplace window (~1,460 calls) takes
+#   ~15 days of wall-clock however it is run. The cloud only makes it unattended,
+#   it does not make it faster.
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: 'Start date (YYYY-MM-DD)'
+        type: string
+        required: true
+      to:
+        description: 'End date (YYYY-MM-DD)'
+        type: string
+        required: true
+      marketplaces:
+        description: 'Comma-separated short-codes or IDs (default: DE,FR,IT,ES)'
+        type: string
+        default: 'DE,FR,IT,ES'
+  # To let it advance UNATTENDED, uncomment this schedule (every 4h). Each run
+  # resumes via --skip-existing. Disable/remove it once the window is complete.
+  # schedule:
+  #   - cron: '0 */4 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  catchup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # just under GitHub's 6h per-job cap
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Sales & Traffic catch-up (EU)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+          SP_API_REGION: ${{ secrets.SP_API_REGION }}
+          SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
+        run: |
+          FROM="${{ github.event.inputs.from }}"
+          TO="${{ github.event.inputs.to }}"
+          MKT="${{ github.event.inputs.marketplaces }}"
+          # Schedule-triggered runs carry no inputs — fall back to the standard window.
+          if [ -z "$FROM" ]; then FROM="2025-07-01"; fi
+          if [ -z "$TO" ]; then TO="2026-06-30"; fi
+          if [ -z "$MKT" ]; then MKT="DE,FR,IT,ES"; fi
+          echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing; resumes each run)"
+          npm run backfill -- --source amazon --report sales-traffic \
+            --region eu --marketplaces "$MKT" --from "$FROM" --to "$TO" --skip-existing
