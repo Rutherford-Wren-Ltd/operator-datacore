@@ -32,6 +32,7 @@
 import { Client as PgClient } from 'pg';
 import { SpApiClient } from './client.js';
 import { runReport, parseTsv } from './reports.js';
+import { salesChannelToMarketplaceId } from '../marketplaces.js';
 
 // Boolean columns in the TSV come as 'true' / 'false' / '' (empty for unknown).
 // pg expects true | false | null.
@@ -134,6 +135,13 @@ export async function ingestOrdersWindow(opts: IngestOrdersWindowOptions): Promi
     const orderId = row['amazon-order-id'];
     if (!orderId) { rowsSkipped++; continue; }
 
+    // GET_FLAT_FILE_ALL_ORDERS is account-wide — a report requested for one
+    // marketplace returns every marketplace's orders. Stamp each row's TRUE
+    // marketplace from its sales-channel domain; fall back to the requested id
+    // only for non-Amazon / unmapped channels. (Pre-fix, opts.marketplaceId was
+    // stamped on all rows, mislabeling e.g. 150k UK orders as DE.)
+    const rowMarketplaceId = salesChannelToMarketplaceId(row['sales-channel']) ?? opts.marketplaceId;
+
     const sku = row.sku || null;
     const asin = row.asin || null;
     // Synthesize a stable order_item_id. The pair (sku, asin) is unique
@@ -195,7 +203,7 @@ export async function ingestOrdersWindow(opts: IngestOrdersWindowOptions): Promi
           raw_id                     = EXCLUDED.raw_id,
           updated_at                 = NOW()`,
         [
-          opts.marketplaceId,
+          rowMarketplaceId,
           orderId,
           row['merchant-order-id'] || null,
           parseTimestamp(row['purchase-date']),

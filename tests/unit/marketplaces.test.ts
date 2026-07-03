@@ -10,7 +10,31 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { MARKETPLACE_ALIASES, resolveMarketplaceFilter } from '../../src/lib/marketplaces.js';
+import { MARKETPLACE_ALIASES, resolveMarketplaceFilter, salesChannelToMarketplaceId } from '../../src/lib/marketplaces.js';
+
+describe('salesChannelToMarketplaceId — order sales-channel domain → marketplace id', () => {
+  it('maps the EU channels the account sells on', () => {
+    assert.equal(salesChannelToMarketplaceId('Amazon.co.uk'), 'A1F83G8C2ARO7P');
+    assert.equal(salesChannelToMarketplaceId('Amazon.de'), 'A1PA6795UKMFR9');
+    assert.equal(salesChannelToMarketplaceId('Amazon.fr'), 'A13V1IB3VIYZZH');
+    assert.equal(salesChannelToMarketplaceId('Amazon.it'), 'APJ6JRA9NG5V4');
+    assert.equal(salesChannelToMarketplaceId('Amazon.es'), 'A1RKKUPIHCS9HS');
+    assert.equal(salesChannelToMarketplaceId('Amazon.com.be'), 'AMEN7PMS3EDWL');
+  });
+
+  it('is case-insensitive and whitespace-tolerant', () => {
+    assert.equal(salesChannelToMarketplaceId('amazon.CO.uk'), 'A1F83G8C2ARO7P');
+    assert.equal(salesChannelToMarketplaceId('  Amazon.de  '), 'A1PA6795UKMFR9');
+  });
+
+  it('returns null for non-Amazon / unmapped / empty channels (caller falls back)', () => {
+    assert.equal(salesChannelToMarketplaceId('Non-Amazon'), null);
+    assert.equal(salesChannelToMarketplaceId('Non-Amazon UK'), null);
+    assert.equal(salesChannelToMarketplaceId(''), null);
+    assert.equal(salesChannelToMarketplaceId(null), null);
+    assert.equal(salesChannelToMarketplaceId(undefined), null);
+  });
+});
 
 describe('MARKETPLACE_ALIASES — canonical short-code → ID', () => {
   it('NA region marketplaces', () => {

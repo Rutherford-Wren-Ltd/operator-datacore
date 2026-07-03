@@ -50,3 +50,36 @@ export function resolveMarketplaceFilter(raw: string | undefined | null): string
     return MARKETPLACE_ALIASES[upper] ?? tok;
   });
 }
+
+// Amazon "sales-channel" (a domain string like "Amazon.co.uk") → marketplace id.
+// The GET_FLAT_FILE_ALL_ORDERS report is ACCOUNT-WIDE — a request scoped to one
+// marketplace still returns every marketplace's orders, each carrying its true
+// domain in the sales-channel column. Use this to stamp the real marketplace_id
+// per row instead of the requested one. Keyed lowercase for case-insensitivity.
+export const SALES_CHANNEL_TO_MARKETPLACE: Record<string, string> = {
+  'amazon.com': 'ATVPDKIKX0DER',
+  'amazon.ca': 'A2EUQ1WTGCTBG2',
+  'amazon.com.mx': 'A1AM78C64UM0Y8',
+  'amazon.co.uk': 'A1F83G8C2ARO7P',
+  'amazon.de': 'A1PA6795UKMFR9',
+  'amazon.fr': 'A13V1IB3VIYZZH',
+  'amazon.it': 'APJ6JRA9NG5V4',
+  'amazon.es': 'A1RKKUPIHCS9HS',
+  'amazon.nl': 'A1805IZSGTT6HS',
+  'amazon.se': 'A2NODRKZP88ZB9',
+  'amazon.pl': 'A1C3SOZRARQ6R3',
+  'amazon.com.be': 'AMEN7PMS3EDWL',
+  'amazon.ie': 'A28R8C7NBKEWEA',
+  'amazon.com.tr': 'A33AVAJ2PDY3EV',
+  'amazon.co.jp': 'A1VC38T7YXB528',
+};
+
+/**
+ * Resolve the true marketplace id from an order's sales-channel domain.
+ * Returns null for non-Amazon channels ("Non-Amazon", "Non-Amazon UK") or any
+ * unmapped domain — callers should fall back to the requested marketplace id.
+ */
+export function salesChannelToMarketplaceId(channel: string | null | undefined): string | null {
+  if (!channel) return null;
+  return SALES_CHANNEL_TO_MARKETPLACE[channel.trim().toLowerCase()] ?? null;
+}
