@@ -320,6 +320,11 @@ jobs:
           SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
           SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
           SP_API_REGION: ${{ secrets.SP_API_REGION }}
+          # Without this, env.ts falls back to its zod default (ATVPDKIKX0DER = US),
+          # and the EU-region listReports call 403s: "marketplaces not valid for
+          # region". Amazon tightened region enforcement ~2026-06-30; the call had
+          # previously been region-loose. Every sibling EU step already sets this.
+          SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
         run: |
           # Settlements: Amazon auto-generates ~one per 14-day cycle per
           # marketplace, so daily runs are cheap — most days just fire a
