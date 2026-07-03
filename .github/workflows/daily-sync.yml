@@ -1,19 +1,34 @@
 name: Daily Sync
 
 # Pulls a short rolling window of Sales & Traffic data from SP-API into
-# Supabase. Idempotent — re-running re-syncs without duplicating.
+# Supabase, plus FX / inventory / ads / orders / finances / settlements.
+# Idempotent — re-running re-syncs without duplicating.
 #
-# RW-AI-OS customisation (see seller-sessions-2026/implementation-plan.md):
+# JOB TOPOLOGY (all data-producing jobs run in PARALLEL; freshness gates them):
+#   sales-traffic   S&T (EU + NA) → rollup           — quota-bound, ~75-125 min
+#   sync            FX, inventory, ads (EU + NA)      — ~125 min
+#   phase7-ingests  orders, finances, settlements,    — ~35 min
+#                   storage fees, inventory age
+#   freshness       verify-sync-freshness             — needs: all three above
+#
+# WHY SPLIT: Sales & Traffic is quota-bound (see below) at up to ~2 h wall-clock
+# and used to run FIRST in a single job, starving the ads/inventory steps behind
+# it until the job hit its timeout. S&T only feeds the rollup, so it now runs in
+# its own job parallel to the independent FX/inventory/ads job — halving the
+# wall-clock and decoupling the timeouts. The freshness dead-man's-switch runs
+# LAST (needs: every producing job) so it checks post-refresh state rather than
+# racing a still-running sibling job (which used to make it flag S&T stale).
+#
+# SALES & TRAFFIC QUOTA:
 # the upstream workflow pulled --months 1 (30 createReport calls) at
 # --concurrency 2 with no delay. Amazon hard-limits GET_SALES_AND_TRAFFIC_REPORT
 # to 1 createReport / 15 min, app-wide and permanent (confirmed by Amazon
 # 2026-05-26, no increase). backfillSalesTraffic enforces this with a hard
 # floor (--delay clamped up to 900000ms, --concurrency clamped to 1), so a
-# 3-day × 5-marketplace pull is 15 calls ≈ 3h45m. That cannot share the sync
-# job with the ads/inventory steps under GitHub's 6h job cap, so the daily S&T
-# steps run with --skip-existing: a normal day pulls only the ~5 new
-# (marketplace, day) pairs (~75 min) and older present days are skipped. Missed
-# days self-heal; a killed run resumes.
+# 3-day × 5-marketplace pull is 15 calls ≈ 3h45m. The daily S&T steps therefore
+# run with --skip-existing: a normal day pulls only the ~5 new (marketplace,
+# day) pairs (~75 min) and older present days are skipped. Missed days
+# self-heal; a killed run resumes.
 #
 # Restatements: Amazon restates S&T for 2-3 days (observed live 2026-05-14:
 # 11 May drifted by £21.98 after the morning pull). --skip-existing does NOT
@@ -45,24 +60,17 @@ permissions:
   contents: read
 
 jobs:
-  sync:
+  # ============================================================================
+  # sales-traffic — quota-bound S&T pull + rollup. Runs in PARALLEL with sync
+  # and phase7-ingests. Isolated into its own job because at 1 createReport /
+  # 15 min it can run to ~2 h and must not starve the ads/inventory steps.
+  # ============================================================================
+  sales-traffic:
     runs-on: ubuntu-latest
-    # Step budget at worst case:
-    #   S&T (EU + NA)           ~75 min  (--skip-existing: ~5 new marketplace-days
-    #                                     × 15 min; older present days skipped)
-    #   Rollup                  <1 min
-    #   FBA inventory (both)    ~20 min total after PR #24 non-zero filter
-    #   Ads SP+SD EU multi-profile @ concurrency=2:
-    #     ceil(9/2)=5 batches × ~15 min   = ~75 min  (9 EU profiles)
-    #   Ads SP+SD NA multi-profile @ concurrency=2:
-    #     ceil(3/2)=2 batches × ~15 min   = ~30 min  (3 NA profiles)
-    # Total worst-case: ~200 min. Bumped to 240 for margin on a slow Amazon
-    # report-queue day. (Was 180 when S&T was budgeted at ~5 min; in reality
-    # S&T is quota-bound at ~75 min even with --skip-existing, and as the first
-    # step it previously starved the ads/inventory steps by consuming the whole
-    # cap — see the S&T note in the header.) Concurrency=2 keeps concurrent
-    # reports per batch at 4 (well inside Amazon's typical 5+ per-app limit).
-    timeout-minutes: 240
+    # Budget: S&T EU ~75 min steady (5 new marketplace-days × 15 min), up to
+    # ~125 min on a backlog day (window not yet fully landed); S&T NA ~16 min;
+    # rollup <1 min. 200 leaves margin for a slow Amazon report queue.
+    timeout-minutes: 200
     steps:
       - uses: actions/checkout@v6
 
@@ -91,11 +99,11 @@ jobs:
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} (concurrency 1, 8s delay between days)"
           # --skip-existing: Amazon caps this report at 1 createReport/15min, so a
-          # 3-day × 5-marketplace window is 15 calls ≈ 3h45m — over the 180min job
-          # cap. Skipping (marketplace, day) pairs already in the lake keeps a normal
-          # daily run to ~5 calls (yesterday × markets). Missed days self-heal; a
-          # killed run resumes. Historical restatement re-pulls go via the separate
-          # sales-traffic-catchup workflow.
+          # 3-day × 5-marketplace window is 15 calls ≈ 3h45m. Skipping (marketplace,
+          # day) pairs already in the lake keeps a normal daily run to ~5 calls
+          # (yesterday × markets). Missed days self-heal; a killed run resumes.
+          # Historical restatement re-pulls go via the separate
+          # sales-traffic-restate-weekly / sales-traffic-catchup workflows.
           npm run backfill -- --source amazon --report sales-traffic \
             --from "$FROM" --to "$TO" --concurrency 1 --delay 8000 --skip-existing
 
@@ -117,12 +125,12 @@ jobs:
           FROM=$(date -u -d "${DAYS} days ago" +%F)
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} for NA region"
-          # --skip-existing: see the EU step above — keeps the daily run inside the
-          # 180min job cap given Amazon's 1 createReport/15min limit.
+          # --skip-existing: see the EU step above.
           npm run backfill -- --source amazon --report sales-traffic --region na \
             --from "$FROM" --to "$TO" --concurrency 1 --delay 8000 --skip-existing
 
       - name: Roll up rollups
+        if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -134,7 +142,8 @@ jobs:
           SP_API_REGION: ${{ secrets.SP_API_REGION }}
         run: |
           # pg_cron handles this on a 14:30 UTC schedule too, but a fresh roll
-          # right after the sync gives the cleanest dashboard read.
+          # right after the S&T pull gives the cleanest dashboard read. if:always
+          # so a partial S&T day still re-rolls what did land.
           node --input-type=module -e "
             import('pg').then(async ({ Client }) => {
               const c = new Client({ connectionString: process.env.SUPABASE_DB_URL, ssl: { rejectUnauthorized: false } });
@@ -144,6 +153,26 @@ jobs:
               await c.end();
             });
           "
+
+  # ============================================================================
+  # sync — FX + inventory + ads. Runs in PARALLEL with sales-traffic. None of
+  # these depend on the S&T pull, so they no longer queue behind it.
+  # ============================================================================
+  sync:
+    runs-on: ubuntu-latest
+    # Budget: FX ~1 min; FBA inventory EU ~55 min + NA ~4 min; Ads EU ~35 min +
+    # NA ~30 min ≈ ~125 min. 180 leaves margin for a slow Amazon report queue.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
 
       - name: Sync FX rates (GBP/EUR → reporting currency)
         env:
@@ -173,7 +202,7 @@ jobs:
         run: |
           # Live JSON snapshot via getInventorySummaries — sits on its own
           # rate-limit bucket, does not compete with the createReport quota
-          # the Sales & Traffic pull above consumes. Idempotent for the day:
+          # the Sales & Traffic pull consumes. Idempotent for the day:
           # re-running replaces the day's rows.
           npm run inventory-snapshot
 
@@ -246,15 +275,14 @@ jobs:
           npm run ads-ingest -- --region NA --concurrency 2
 
   # ============================================================================
-  # phase7-ingests — runs in PARALLEL with the sync job above.
+  # phase7-ingests — runs in PARALLEL with the jobs above.
   #
   # These pull from non-S&T SP-API surfaces (Orders Report, listFinancialEvents,
   # Settlement Report) which have their own rate-limit buckets, so they don't
-  # compete with the sync job's createReport quota and can run concurrently
-  # without impacting the existing ~135-min worst-case wall-clock.
+  # compete with the createReport quota and can run concurrently.
   #
-  # All three CLIs are idempotent for the date window — re-running upserts
-  # without duplicating.
+  # All CLIs are idempotent for the date window — re-running upserts without
+  # duplicating.
   # ============================================================================
   phase7-ingests:
     runs-on: ubuntu-latest
@@ -420,17 +448,36 @@ jobs:
           fi
           npm run ingest-inventory-age
 
-      # Dead-man's-switch: queries meta.sync_freshness (migration 0037) and
-      # exits non-zero if any object's hours_since_last_success exceeds its
-      # inline per-object cadence (orders/sales-traffic/finances/settlements
-      # at 25h, weekly objects at 8d, monthly at 35d). The GitHub Actions
-      # email-on-failure becomes the single high-signal alert that replaces
-      # the previous per-step failure noise — added 2026-06-18 alongside the
-      # NA settlement step removal so the workflow goes from "consistently
-      # red with one known-benign failure" to "green unless something is
-      # actually stale".
+  # ============================================================================
+  # freshness — dead-man's-switch. needs: every producing job so it evaluates
+  # POST-refresh state (previously it lived inside phase7-ingests and raced the
+  # still-running S&T job, spuriously flagging sales_traffic_report stale).
+  # if: always() so it runs — and reports staleness — even when a producing job
+  # fails or is cancelled.
+  #
+  # Queries meta.sync_freshness (migration 0037) and exits non-zero if any
+  # object's hours_since_last_success exceeds its inline per-object cadence
+  # (orders/sales-traffic/finances/settlements at 25h, weekly objects at 8d,
+  # monthly at 35d). The GitHub Actions email-on-failure is the single
+  # high-signal alert — added 2026-06-18 to replace per-step failure noise.
+  # ============================================================================
+  freshness:
+    runs-on: ubuntu-latest
+    needs: [sales-traffic, sync, phase7-ingests]
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
       - name: Verify sync freshness
-        if: always()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
