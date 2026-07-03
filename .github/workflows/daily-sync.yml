@@ -5,19 +5,22 @@ name: Daily Sync
 #
 # RW-AI-OS customisation (see seller-sessions-2026/implementation-plan.md):
 # the upstream workflow pulled --months 1 (30 createReport calls) at
-# --concurrency 2 with no delay. The Sales & Traffic createReport quota on
-# this (brand-new) LWA app is a small burst bucket (~3 calls) with a slow
-# refill, so an unbounded delay alone does not clear it. We pull a 3-day
-# rolling window (yesterday + a 2-day restatement buffer) at --concurrency 1
-# --delay 8000. Amazon restates S&T for 2-3 days; a 2-day window misses
-# D-3 restatements (observed live on 2026-05-14: 11 May drifted by £21.98
-# after our morning pull, invisible until manually re-pulled). The 3rd call
-# can trip the burst ceiling, but client.ts now honours
-# x-amzn-RateLimit-Limit / Retry-After on 429 so it waits for the bucket
-# rather than failing the run. The window will widen further once Amazon
-# raises the app's rate limit with usage history. Large historical
-# catch-ups stay a local `npm run backfill` job; they cannot fit the
-# Actions timeout under this quota.
+# --concurrency 2 with no delay. Amazon hard-limits GET_SALES_AND_TRAFFIC_REPORT
+# to 1 createReport / 15 min, app-wide and permanent (confirmed by Amazon
+# 2026-05-26, no increase). backfillSalesTraffic enforces this with a hard
+# floor (--delay clamped up to 900000ms, --concurrency clamped to 1), so a
+# 3-day × 5-marketplace pull is 15 calls ≈ 3h45m. That cannot share the sync
+# job with the ads/inventory steps under GitHub's 6h job cap, so the daily S&T
+# steps run with --skip-existing: a normal day pulls only the ~5 new
+# (marketplace, day) pairs (~75 min) and older present days are skipped. Missed
+# days self-heal; a killed run resumes.
+#
+# Restatements: Amazon restates S&T for 2-3 days (observed live 2026-05-14:
+# 11 May drifted by £21.98 after the morning pull). --skip-existing does NOT
+# re-pull an already-present day, so restatement reconciliation is handled by
+# the separate sales-traffic-restate-weekly workflow (weekly non-skip re-pull
+# of the trailing window). Large historical catch-ups go via the
+# sales-traffic-catchup workflow. Neither can fit the daily quota window here.
 #
 # To enable:
 # 1. In Settings → Secrets and variables → Actions, add the secrets listed
@@ -45,17 +48,21 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     # Step budget at worst case:
-    #   S&T (EU + NA)           ~5 min
+    #   S&T (EU + NA)           ~75 min  (--skip-existing: ~5 new marketplace-days
+    #                                     × 15 min; older present days skipped)
     #   Rollup                  <1 min
     #   FBA inventory (both)    ~20 min total after PR #24 non-zero filter
     #   Ads SP+SD EU multi-profile @ concurrency=2:
     #     ceil(9/2)=5 batches × ~15 min   = ~75 min  (9 EU profiles)
     #   Ads SP+SD NA multi-profile @ concurrency=2:
     #     ceil(3/2)=2 batches × ~15 min   = ~30 min  (3 NA profiles)
-    # Total worst-case: ~135 min. Bumped to 180 to absorb a slow Amazon
-    # report queue day. Concurrency=2 keeps concurrent reports per
-    # batch at 4 (well inside Amazon's typical 5+ per-app limit).
-    timeout-minutes: 180
+    # Total worst-case: ~200 min. Bumped to 240 for margin on a slow Amazon
+    # report-queue day. (Was 180 when S&T was budgeted at ~5 min; in reality
+    # S&T is quota-bound at ~75 min even with --skip-existing, and as the first
+    # step it previously starved the ads/inventory steps by consuming the whole
+    # cap — see the S&T note in the header.) Concurrency=2 keeps concurrent
+    # reports per batch at 4 (well inside Amazon's typical 5+ per-app limit).
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
 
@@ -83,8 +90,14 @@ jobs:
           FROM=$(date -u -d "${DAYS} days ago" +%F)
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} (concurrency 1, 8s delay between days)"
+          # --skip-existing: Amazon caps this report at 1 createReport/15min, so a
+          # 3-day × 5-marketplace window is 15 calls ≈ 3h45m — over the 180min job
+          # cap. Skipping (marketplace, day) pairs already in the lake keeps a normal
+          # daily run to ~5 calls (yesterday × markets). Missed days self-heal; a
+          # killed run resumes. Historical restatement re-pulls go via the separate
+          # sales-traffic-catchup workflow.
           npm run backfill -- --source amazon --report sales-traffic \
-            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000 --skip-existing
 
       - name: Pull Sales & Traffic (NA)
         env:
@@ -104,8 +117,10 @@ jobs:
           FROM=$(date -u -d "${DAYS} days ago" +%F)
           TO=$(date -u -d "yesterday" +%F)
           echo "Pulling Sales & Traffic ${FROM} → ${TO} for NA region"
+          # --skip-existing: see the EU step above — keeps the daily run inside the
+          # 180min job cap given Amazon's 1 createReport/15min limit.
           npm run backfill -- --source amazon --report sales-traffic --region na \
-            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000 --skip-existing
 
       - name: Roll up rollups
         env:

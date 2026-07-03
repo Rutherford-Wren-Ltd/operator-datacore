@@ -1,0 +1,99 @@
+name: Sales & Traffic Restatement Re-pull (weekly)
+
+# WHY THIS EXISTS:
+#   The daily-sync Sales & Traffic step runs with --skip-existing so it fits the
+#   180-min sync-job cap (Amazon hard-limits GET_SALES_AND_TRAFFIC_REPORT to 1
+#   createReport / 15 min, so a 3-day × 5-marketplace pull is ~3h45m and cannot
+#   share a job with the ads/inventory steps under GitHub's 6h job cap). But
+#   --skip-existing never re-pulls a day already in the lake, so it does NOT
+#   capture Amazon's D-2/D-3 restatements of sales/traffic (observed live on
+#   2026-05-14: 11 May drifted by £21.98 after the morning pull).
+#
+#   This workflow closes that gap: once a week it re-pulls the last few days
+#   WITHOUT --skip-existing, so the most recent restatement window is reconciled
+#   to Amazon's final numbers. It runs in its own job (not gated by ads), with a
+#   350-min timeout (just under GitHub's 6h cap).
+#
+# COVERAGE IS BEST-EFFORT, NOT COMPLETE:
+#   At 1 call / 15 min, re-pulling every day × 5 EU marketplaces often enough to
+#   catch every restatement is not quota-feasible in Actions. This refreshes the
+#   trailing --days window weekly (default 4), which reconciles the bulk of
+#   restatement drift; days that restate and then age out before the next weekly
+#   run keep their first-pull value. Widen --days or add a mid-week run if a
+#   marketplace proves to restate further out.
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: 'Trailing days to re-pull, non-skip (default: 4 = covers the 2-3 day restatement window + margin)'
+        type: string
+        default: '4'
+  schedule:
+    # Sunday 03:00 UTC — off-peak, well before the 15:00 daily-sync run.
+    - cron: '0 3 * * 0'
+
+permissions:
+  contents: read
+
+jobs:
+  restate-eu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # just under GitHub's 6h per-job cap
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Re-pull Sales & Traffic (EU, non-skip)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+          SP_API_REGION: ${{ secrets.SP_API_REGION }}
+          SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
+        run: |
+          DAYS="${{ github.event.inputs.days || '4' }}"
+          FROM=$(date -u -d "${DAYS} days ago" +%F)
+          TO=$(date -u -d "yesterday" +%F)
+          echo "Restatement re-pull (EU, non-skip) ${FROM} → ${TO}"
+          # NO --skip-existing: deliberately re-pull already-present days so their
+          # restated values overwrite the first-pull values.
+          npm run backfill -- --source amazon --report sales-traffic \
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
+
+  restate-na:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Install dependencies
+        run: npm ci
+      - name: Re-pull Sales & Traffic (NA, non-skip)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+          SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
+        run: |
+          DAYS="${{ github.event.inputs.days || '4' }}"
+          FROM=$(date -u -d "${DAYS} days ago" +%F)
+          TO=$(date -u -d "yesterday" +%F)
+          echo "Restatement re-pull (NA, non-skip) ${FROM} → ${TO}"
+          npm run backfill -- --source amazon --report sales-traffic --region na \
+            --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
