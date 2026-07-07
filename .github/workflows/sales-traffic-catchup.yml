@@ -34,13 +34,25 @@ on:
         description: 'Comma-separated short-codes or IDs (default: DE,FR,IT,ES)'
         type: string
         default: 'DE,FR,IT,ES'
-  # To let it advance UNATTENDED, uncomment this schedule (every 4h). Each run
-  # resumes via --skip-existing. Disable/remove it once the window is complete.
-  # schedule:
-  #   - cron: '0 */4 * * *'
+  # Unattended: two runs/day in quiet windows that miss the 15:00-UTC daily-sync
+  # and the Sun-03:00-UTC restatement. A 350-min job finishes (~07:00→12:50 /
+  # 20:00→01:50) long before the next fire, so runs never overlap each other or
+  # those workflows. Each run resumes via --skip-existing; remove this schedule
+  # once the window is fully landed. (Do NOT use a sub-4h cadence: the job is
+  # longer than the interval and the S&T quota is app-wide — see concurrency.)
+  schedule:
+    - cron: '0 7,20 * * *'
 
 permissions:
   contents: read
+
+# GET_SALES_AND_TRAFFIC_REPORT is throttled to 1 createReport / 15 min APP-WIDE.
+# Share one concurrency group with every other S&T caller (daily-sync's
+# sales-traffic job, restate-weekly) so only one runs at a time — otherwise they
+# 429-contend on the same bucket and can time the daily-sync out.
+concurrency:
+  group: sp-api-sales-traffic
+  cancel-in-progress: false
 
 jobs:
   catchup:

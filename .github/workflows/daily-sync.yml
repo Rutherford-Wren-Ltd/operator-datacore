@@ -66,6 +66,12 @@ jobs:
   # 15 min it can run to ~2 h and must not starve the ads/inventory steps.
   # ============================================================================
   sales-traffic:
+    # The S&T createReport quota (1/15-min) is APP-WIDE, shared with the
+    # sales-traffic-catchup + restate-weekly workflows. This group serialises
+    # all three so they never 429-contend (which could blow this job's timeout).
+    concurrency:
+      group: sp-api-sales-traffic
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     # Budget: S&T EU ~75 min steady (5 new marketplace-days × 15 min), up to
     # ~125 min on a backlog day (window not yet fully landed); S&T NA ~16 min;
