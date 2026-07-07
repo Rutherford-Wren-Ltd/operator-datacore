@@ -84,8 +84,11 @@ jobs:
           FROM="${{ github.event.inputs.from }}"
           TO="${{ github.event.inputs.to }}"
           MKT="${{ github.event.inputs.marketplaces }}"
-          # Schedule-triggered runs carry no inputs — fall back to the standard window.
-          if [ -z "$FROM" ]; then FROM="2025-07-01"; fi
+          # Schedule-triggered runs carry no inputs — fall back to the full ~2yr
+          # window (Amazon's S&T retention edge) so unattended runs complete the
+          # entire DE-EU history, not just the last 12 months. --skip-existing +
+          # the shared concurrency group make repeated wide-window runs cheap.
+          if [ -z "$FROM" ]; then FROM="2024-07-01"; fi
           if [ -z "$TO" ]; then TO="2026-06-30"; fi
           if [ -z "$MKT" ]; then MKT="DE,FR,IT,ES"; fi
           echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing; resumes each run)"
