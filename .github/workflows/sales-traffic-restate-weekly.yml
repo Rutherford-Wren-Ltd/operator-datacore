@@ -38,6 +38,11 @@ permissions:
 
 jobs:
   restate-eu:
+    # Shares the app-wide S&T createReport quota with daily-sync + catch-up;
+    # the shared group serialises all S&T jobs so they never 429-contend.
+    concurrency:
+      group: sp-api-sales-traffic
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 350   # just under GitHub's 6h per-job cap
     steps:
@@ -70,6 +75,11 @@ jobs:
             --from "$FROM" --to "$TO" --concurrency 1 --delay 8000
 
   restate-na:
+    # Shares the app-wide S&T createReport quota with daily-sync + catch-up;
+    # the shared group serialises all S&T jobs so they never 429-contend.
+    concurrency:
+      group: sp-api-sales-traffic
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
