@@ -34,14 +34,16 @@ on:
         description: 'Comma-separated short-codes or IDs (default: DE)'
         type: string
         default: 'DE'
-  # Unattended: two runs/day in quiet windows that miss the 15:00-UTC daily-sync
-  # and the Sun-03:00-UTC restatement. A 350-min job finishes (~07:00→12:50 /
-  # 20:00→01:50) long before the next fire, so runs never overlap each other or
-  # those workflows. Each run resumes via --skip-existing; remove this schedule
-  # once the window is fully landed. (Do NOT use a sub-4h cadence: the job is
-  # longer than the interval and the S&T quota is app-wide — see concurrency.)
+  # Unattended: FOUR runs/day, every 6h (>the 350-min job length, so runs never
+  # overlap each other). ~4×23 ≈ 92 calls/day, near Amazon's 1-per-15-min ceiling,
+  # to finish DE + 12 months in ~3 days. The 13:00 run spans the 15:00-UTC
+  # daily-sync; the shared sp-api-sales-traffic concurrency group serialises them
+  # (the daily-sync's S&T sub-job waits behind the catch-up — low impact, since
+  # the catch-up is already landing recent DE). Each run resumes via
+  # --skip-existing. TEMPORARY throughput bump: revert to '0 7,20 * * *'
+  # (2 runs/day, daily-sync-safe) once the DE window is fully landed.
   schedule:
-    - cron: '0 7,20 * * *'
+    - cron: '0 1,7,13,19 * * *'
 
 permissions:
   contents: read
