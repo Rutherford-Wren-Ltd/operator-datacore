@@ -31,17 +31,19 @@ on:
         type: string
         required: true
       marketplaces:
-        description: 'Comma-separated short-codes or IDs (default: DE,FR,IT,ES)'
+        description: 'Comma-separated short-codes or IDs (default: DE)'
         type: string
-        default: 'DE,FR,IT,ES'
-  # Unattended: two runs/day in quiet windows that miss the 15:00-UTC daily-sync
-  # and the Sun-03:00-UTC restatement. A 350-min job finishes (~07:00→12:50 /
-  # 20:00→01:50) long before the next fire, so runs never overlap each other or
-  # those workflows. Each run resumes via --skip-existing; remove this schedule
-  # once the window is fully landed. (Do NOT use a sub-4h cadence: the job is
-  # longer than the interval and the S&T quota is app-wide — see concurrency.)
+        default: 'DE'
+  # Unattended: FOUR runs/day, every 6h (>the 350-min job length, so runs never
+  # overlap each other). ~4×23 ≈ 92 calls/day, near Amazon's 1-per-15-min ceiling,
+  # to finish DE + 12 months in ~3 days. The 13:00 run spans the 15:00-UTC
+  # daily-sync; the shared sp-api-sales-traffic concurrency group serialises them
+  # (the daily-sync's S&T sub-job waits behind the catch-up — low impact, since
+  # the catch-up is already landing recent DE). Each run resumes via
+  # --skip-existing. TEMPORARY throughput bump: revert to '0 7,20 * * *'
+  # (2 runs/day, daily-sync-safe) once the DE window is fully landed.
   schedule:
-    - cron: '0 7,20 * * *'
+    - cron: '0 1,7,13,19 * * *'
 
 permissions:
   contents: read
@@ -84,17 +86,17 @@ jobs:
           FROM="${{ github.event.inputs.from }}"
           TO="${{ github.event.inputs.to }}"
           MKT="${{ github.event.inputs.marketplaces }}"
-          # Schedule-triggered runs carry no inputs — fall back to a DYNAMIC
-          # within-retention window. Amazon's S&T retention edge is ~24 months;
-          # a fixed old FROM (e.g. 2024-07-01) drifts past the edge, and those
-          # dates return CANCELLED with no landed row, so --skip-existing used to
-          # re-attempt them every run — the backfill got stuck re-confirming dead
-          # dates and never reached real data. Anchoring FROM 23 months back
-          # (1-month margin inside retention) and TO to yesterday keeps the whole
-          # window fetchable; the no-data marker handles any stray empty days.
-          if [ -z "$FROM" ]; then FROM="$(date -u -d '23 months ago' +%F)"; fi
+          # Schedule-triggered runs carry no inputs — fall back to a DYNAMIC,
+          # FOCUSED window: DE only, last 12 months. Rationale: S&T is 1 report
+          # per (marketplace, day) at 1 createReport / 15 min, so the full 2yr ×
+          # 4 markets is an ~8-week grind. DE is the priority market and the last
+          # 12 months is the high-value window, so we finish that (~3 days) first;
+          # widen to FR/IT/ES or 23 months later via workflow_dispatch inputs.
+          # FROM stays within Amazon's ~24-month retention; TO=yesterday. The
+          # no-data marker skips any stray empty days so runs never re-loop.
+          if [ -z "$FROM" ]; then FROM="$(date -u -d '12 months ago' +%F)"; fi
           if [ -z "$TO" ]; then TO="$(date -u -d 'yesterday' +%F)"; fi
-          if [ -z "$MKT" ]; then MKT="DE,FR,IT,ES"; fi
+          if [ -z "$MKT" ]; then MKT="DE"; fi
           echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing; resumes each run)"
           npm run backfill -- --source amazon --report sales-traffic \
             --region eu --marketplaces "$MKT" --from "$FROM" --to "$TO" --skip-existing
