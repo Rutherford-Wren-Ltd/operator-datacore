@@ -412,6 +412,25 @@ export async function backfillSalesTraffic(opts: {
           if (err instanceof ReportCancelledError) {
             tasksCancelled++;
             done++;
+            // Persist a no-data marker so --skip-existing skips this
+            // (marketplace, day) on future runs instead of re-spending a 15-min
+            // createReport rediscovering the same empty date (retention-edge or
+            // no-Brand-Analytics day). asin='-' is a day-level sentinel (S&T is
+            // not per-ASIN). Best-effort: a marker write must never abort the run.
+            try {
+              await activePg.query(
+                `INSERT INTO meta.report_fatal_marker
+                   (object, marketplace_id, asin, period_type, period_start, reason)
+                 VALUES ('sales_traffic_report', $1, '-', 'DAY', $2, 'cancelled')
+                 ON CONFLICT (object, marketplace_id, asin, period_type, period_start) DO UPDATE
+                   SET last_seen_at = NOW(),
+                       fail_count   = meta.report_fatal_marker.fail_count + 1`,
+                [t.marketplaceId, t.day.toISOString().slice(0, 10)],
+              );
+            } catch (markErr) {
+              const m = markErr instanceof Error ? markErr.message : String(markErr);
+              console.warn(`[sales-traffic] no-data marker write failed for ${t.marketplaceId} ${t.day.toISOString().slice(0, 10)}: ${m}`);
+            }
             opts.onProgress?.({
               day: t.day.toISOString().slice(0, 10),
               marketplace: t.marketplaceId,

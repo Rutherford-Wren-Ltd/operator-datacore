@@ -84,12 +84,16 @@ jobs:
           FROM="${{ github.event.inputs.from }}"
           TO="${{ github.event.inputs.to }}"
           MKT="${{ github.event.inputs.marketplaces }}"
-          # Schedule-triggered runs carry no inputs — fall back to the full ~2yr
-          # window (Amazon's S&T retention edge) so unattended runs complete the
-          # entire DE-EU history, not just the last 12 months. --skip-existing +
-          # the shared concurrency group make repeated wide-window runs cheap.
-          if [ -z "$FROM" ]; then FROM="2024-07-01"; fi
-          if [ -z "$TO" ]; then TO="2026-06-30"; fi
+          # Schedule-triggered runs carry no inputs — fall back to a DYNAMIC
+          # within-retention window. Amazon's S&T retention edge is ~24 months;
+          # a fixed old FROM (e.g. 2024-07-01) drifts past the edge, and those
+          # dates return CANCELLED with no landed row, so --skip-existing used to
+          # re-attempt them every run — the backfill got stuck re-confirming dead
+          # dates and never reached real data. Anchoring FROM 23 months back
+          # (1-month margin inside retention) and TO to yesterday keeps the whole
+          # window fetchable; the no-data marker handles any stray empty days.
+          if [ -z "$FROM" ]; then FROM="$(date -u -d '23 months ago' +%F)"; fi
+          if [ -z "$TO" ]; then TO="$(date -u -d 'yesterday' +%F)"; fi
           if [ -z "$MKT" ]; then MKT="DE,FR,IT,ES"; fi
           echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing; resumes each run)"
           npm run backfill -- --source amazon --report sales-traffic \
