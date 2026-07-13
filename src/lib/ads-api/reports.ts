@@ -108,9 +108,10 @@ export interface PollOptions {
   initialWaitMs?: number;
   /** Wait between polls. Defaults to 15s. */
   intervalMs?: number;
-  /** Hard cap on total wait. Defaults to 30 minutes — Amazon's report queue
-   *  occasionally takes 14+ minutes even for one-day reports, so 15 was too
-   *  tight in practice. */
+  /** Hard cap on total wait. Defaults to 45 minutes — Amazon's report queue
+   *  occasionally takes 14+ minutes even for one-day reports, and the larger US
+   *  profile has been sitting PENDING past 30 min (which failed the daily-sync
+   *  Ads step 4 of 5 days in Jul 2026), so 30 was still too tight in practice. */
   timeoutMs?: number;
   onPoll?: (info: { attempt: number; status: ReportStatus; elapsedMs: number }) => void;
 }
@@ -126,7 +127,7 @@ export async function pollReport(
 ): Promise<GetReportResponse> {
   const initialWaitMs = opts.initialWaitMs ?? 20_000;
   const intervalMs = opts.intervalMs ?? 15_000;
-  const timeoutMs = opts.timeoutMs ?? 30 * 60 * 1000;
+  const timeoutMs = opts.timeoutMs ?? 45 * 60 * 1000;
   const startedAt = Date.now();
 
   await sleep(initialWaitMs);
