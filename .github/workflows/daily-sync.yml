@@ -225,6 +225,11 @@ jobs:
         run: npm run inventory-snapshot -- --region na
 
       - name: Pull Ads SP + SD daily (primary region — EU)
+        # Amazon's Ads report queue can leave a report PENDING past the poll
+        # ceiling (esp. the larger US profile) — transient slowness the CLI
+        # already retries next run. Don't let it red-X the whole daily-sync; the
+        # freshness job still surfaces genuinely-stale ads data.
+        continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
@@ -262,6 +267,8 @@ jobs:
           npm run ads-ingest -- --concurrency 2
 
       - name: Pull Ads SP + SD daily (NA)
+        # See the EU step: a slow/stuck Amazon Ads report must not fail the sync.
+        continue-on-error: true
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
