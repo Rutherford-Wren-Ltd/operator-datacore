@@ -40,6 +40,7 @@ interface ParsedArgs {
   region: SpApiRegion | null;
   marketplaceFilter: string[] | null;
   skipExisting: boolean;
+  retryCancelled: boolean;
 }
 
 function parseCliArgs(): ParsedArgs {
@@ -58,6 +59,10 @@ function parseCliArgs(): ParsedArgs {
       region: { type: 'string' },
       marketplaces: { type: 'string' },
       'skip-existing': { type: 'boolean', default: false },
+      // Re-attempt (marketplace, day) pairs previously recorded as no-data in
+      // meta.report_fatal_marker instead of skipping them (e.g. to recheck a
+      // day whose data may have since landed). Off by default.
+      'retry-cancelled': { type: 'boolean', default: false },
     },
   });
 
@@ -85,6 +90,7 @@ function parseCliArgs(): ParsedArgs {
     region,
     marketplaceFilter: resolveMarketplaceFilter(values.marketplaces),
     skipExisting: values['skip-existing'] ?? false,
+    retryCancelled: values['retry-cancelled'] ?? false,
   };
 }
 
@@ -93,6 +99,7 @@ async function loadExistingKeys(
   marketplaceIds: string[],
   fromDate: Date,
   toDate: Date,
+  includeCancelledMarkers: boolean,
 ): Promise<Set<string>> {
   // Cast metric_date to text in SQL so node-postgres never parses it through
   // its DATE → JS Date converter. That converter builds the Date at LOCAL
@@ -110,6 +117,26 @@ async function loadExistingKeys(
   const keys = new Set<string>();
   for (const r of rows) {
     keys.add(`${r.marketplace_id}|${r.metric_date}`);
+  }
+
+  // Also skip (marketplace, day) pairs Amazon previously returned CANCELLED
+  // (no data) for — recorded in meta.report_fatal_marker by backfillSalesTraffic.
+  // Without this a retention-edge / no-Brand-Analytics day (which lands no row
+  // in sales_traffic_daily) is re-attempted every run, burning a 15-min
+  // createReport to rediscover the same nothing. --retry-cancelled opts back in.
+  if (includeCancelledMarkers) {
+    const { rows: marks } = await pg.query<{ marketplace_id: string; period_start: string }>(
+      `SELECT marketplace_id, to_char(period_start, 'YYYY-MM-DD') AS period_start
+         FROM meta.report_fatal_marker
+        WHERE object = 'sales_traffic_report'
+          AND reason = 'cancelled'
+          AND marketplace_id = ANY($1)
+          AND period_start BETWEEN $2 AND $3`,
+      [marketplaceIds, fromDate.toISOString().slice(0, 10), toDate.toISOString().slice(0, 10)],
+    );
+    for (const r of marks) {
+      keys.add(`${r.marketplace_id}|${r.period_start}`);
+    }
   }
   return keys;
 }
@@ -204,8 +231,8 @@ async function main(): Promise<void> {
     // 3. Optionally load already-ingested (marketplace, day) keys to skip
     let existingKeys: Set<string> | undefined;
     if (args.skipExisting) {
-      existingKeys = await loadExistingKeys(pg, marketplaceIds, fromDate, toDate);
-      console.log(`  Skip set:      ${existingKeys.size} (marketplace, day) pairs already present`);
+      existingKeys = await loadExistingKeys(pg, marketplaceIds, fromDate, toDate, !args.retryCancelled);
+      console.log(`  Skip set:      ${existingKeys.size} (marketplace, day) pairs already present or marked no-data`);
       console.log('');
     }
 
@@ -255,10 +282,10 @@ async function main(): Promise<void> {
     );
     if (result.tasksCancelled > 0) {
       console.log(
-        `Note: ${result.tasksCancelled} day(s) returned CANCELLED — usually the retention edge ` +
-        `(${'>'}24mo old) or a marketplace without Brand Analytics for that period. Those days ` +
-        `have no rows in brain.sales_traffic_daily, so --skip-existing will retry them on the ` +
-        `next run — Amazon will CANCEL again and the loop skips again. Safe, just noisy.`,
+        `Note: ${result.tasksCancelled} day(s) returned CANCELLED (no data) — usually the retention ` +
+        `edge (${'>'}~24mo old) or a marketplace without Brand Analytics for that period. Each is ` +
+        `recorded in meta.report_fatal_marker, so --skip-existing skips it next run instead of ` +
+        `re-spending a 15-min createReport on it. Pass --retry-cancelled to re-check them.`,
       );
     }
     console.log('Next: run  npm run verify  to compare against Seller Central.');
