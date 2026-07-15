@@ -60,10 +60,6 @@ concurrency:
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: infrastructure/operator-datacore
-
 jobs:
   sqp:
     runs-on: ubuntu-latest
@@ -79,15 +75,12 @@ jobs:
       matrix:
         region: [eu, na]
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: infrastructure/operator-datacore/package-lock.json
 
       - name: Check region credentials
         id: creds
