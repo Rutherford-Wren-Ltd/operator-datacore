@@ -1,0 +1,150 @@
+name: SQP sync (weekly + monthly)
+
+# Pulls Brand Analytics Search Query Performance (SQP) into
+# brain.search_query_performance on a schedule, so the table stays current
+# instead of drifting between hand-run backfills. This closes the "daily-sync
+# hook is a Phase 7 follow-up" gap noted in docs/runbooks/search-query-backfill.md.
+#
+# Two grains, because SQP publishes at two grains with different lags and
+# neither alone is enough:
+#   - WEEK  (Sun-Sat): freshest signal, published a few days after week-end.
+#           Pulled every Wednesday for the just-closed week (plus a short
+#           trailing buffer so a missed run self-heals).
+#   - MONTH (calendar): the canonical grain with the long 17-month lookback,
+#           published a few days into the next month. Pulled on the 8th.
+#
+# Scope is top-N ASINs by recent units (per marketplace). The long tail mostly
+# returns no SQP data, so top-N keeps each run well inside the SP-API
+# createReport quota (~1 call / 45s; the CLI floors at 60s) and the job
+# timeout. Widen with a larger --top-n via workflow_dispatch when needed.
+#
+# Idempotent: --skip-existing drops (period, marketplace, ASIN) tuples already
+# present, so re-runs and overlapping trailing windows never duplicate work.
+#
+# REQUIRED REPO SECRETS (same values as the local .env; most already set for
+# daily-sync.yml):
+#   SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_DB_URL
+#   SP_API_LWA_CLIENT_ID, SP_API_LWA_CLIENT_SECRET
+#   SP_API_EU_REFRESH_TOKEN     (UK / EU region)
+#   SP_API_NA_REFRESH_TOKEN     (US / NA region — optional; the na leg skips
+#                                itself if this is not set)
+# Optional marketplace overrides (default to UK for eu, US for na):
+#   SP_API_EU_MARKETPLACE_IDS, SP_API_NA_MARKETPLACE_IDS
+
+on:
+  schedule:
+    - cron: "0 6 * * 3"   # Wed 06:00 UTC — WEEK grain (prior Sun-Sat now published)
+    - cron: "0 7 8 * *"   # 8th 07:00 UTC — MONTH grain (prior calendar month now published)
+  workflow_dispatch:
+    inputs:
+      period_type:
+        description: "Grain to pull"
+        type: choice
+        options: [WEEK, MONTH]
+        default: WEEK
+      count:
+        description: "Trailing periods to sweep (weeks or months). Blank = 3 for WEEK, 2 for MONTH."
+        type: string
+        default: ""
+      top_n:
+        description: "Top N ASINs by 30-day units, per marketplace"
+        type: string
+        default: "75"
+
+# Keep the weekly WEEK run and the monthly MONTH run from cancelling each
+# other, and never cancel a pull mid-flight (a killed run wastes SP-API quota).
+concurrency:
+  group: sqp-sync-${{ github.event.schedule || github.event.inputs.period_type || 'manual' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: infrastructure/operator-datacore
+
+jobs:
+  sqp:
+    runs-on: ubuntu-latest
+    # Worst case is a first WEEK run with no history: top-75 x 3 weeks = 225
+    # calls x 60s ~= 3.75h for one region. Steady state (skip-existing, one new
+    # period) is ~75 calls ~= 75 min. 330 leaves headroom under the 6h ceiling.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      # Each region uses its own regional SP-API endpoint and refresh token, so
+      # the two legs run as independent jobs without contending for the same
+      # createReport bucket.
+      matrix:
+        region: [eu, na]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: infrastructure/operator-datacore/package-lock.json
+
+      - name: Check region credentials
+        id: creds
+        env:
+          SP_API_EU_REFRESH_TOKEN: ${{ secrets.SP_API_EU_REFRESH_TOKEN }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+        run: |
+          if [ "${{ matrix.region }}" = "eu" ]; then TOK="$SP_API_EU_REFRESH_TOKEN"; else TOK="$SP_API_NA_REFRESH_TOKEN"; fi
+          if [ -z "$TOK" ]; then
+            echo "::notice::No SP_API_${{ matrix.region }} refresh token configured — skipping the ${{ matrix.region }} leg."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.creds.outputs.run == 'true'
+        run: npm ci
+
+      - name: Pull SQP (${{ matrix.region }})
+        if: steps.creds.outputs.run == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
+          SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          SP_API_EU_REFRESH_TOKEN: ${{ secrets.SP_API_EU_REFRESH_TOKEN }}
+          SP_API_EU_MARKETPLACE_IDS: ${{ secrets.SP_API_EU_MARKETPLACE_IDS }}
+          SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
+          SP_API_NA_MARKETPLACE_IDS: ${{ secrets.SP_API_NA_MARKETPLACE_IDS }}
+        run: |
+          set -euo pipefail
+
+          # Grain + trailing window: workflow_dispatch input wins, otherwise map
+          # the firing cron to its grain.
+          PT="${{ github.event.inputs.period_type }}"
+          CNT="${{ github.event.inputs.count }}"
+          TOPN="${{ github.event.inputs.top_n }}"
+          if [ -z "$PT" ]; then
+            case "${{ github.event.schedule }}" in
+              "0 7 8 * *") PT="MONTH" ;;
+              *)           PT="WEEK" ;;
+            esac
+          fi
+          if [ "$PT" = "MONTH" ]; then
+            COUNT_FLAG="--months"; [ -z "$CNT" ] && CNT="2"
+          else
+            COUNT_FLAG="--weeks";  [ -z "$CNT" ] && CNT="3"
+          fi
+          [ -z "$TOPN" ] && TOPN="75"
+
+          echo "Pulling SQP: grain=$PT window=$CNT region=${{ matrix.region }} top_n=$TOPN (skip-existing)"
+          npm run backfill-search-query -- \
+            --period-type "$PT" \
+            "$COUNT_FLAG" "$CNT" \
+            --region "${{ matrix.region }}" \
+            --top-n "$TOPN" \
+            --skip-existing
