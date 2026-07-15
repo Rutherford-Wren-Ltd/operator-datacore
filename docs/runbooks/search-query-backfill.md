@@ -94,6 +94,31 @@ npm run backfill-search-query -- `
 
 26 weeks × ~60s = ~26 min wall-clock per marketplace.
 
+## Automated sync (GitHub Actions)
+
+`.github/workflows/sqp-sync.yml` runs this CLI on a schedule so the table
+stays current without anyone running a backfill by hand:
+
+- **WEEK grain** every Wednesday 06:00 UTC (the just-closed Sun-Sat week,
+  plus a short trailing buffer so a missed run self-heals).
+- **MONTH grain** on the 8th at 07:00 UTC (the prior calendar month, once
+  Amazon has published it).
+
+Both legs run per region (`eu`, `na`), scoped to the top-N ASINs by 30-day
+units, with `--skip-existing`. The `na` leg skips itself if
+`SP_API_NA_REFRESH_TOKEN` is not set. Trigger an ad-hoc pull (any grain,
+window, or top-N) from the Actions tab via "Run workflow".
+
+Staleness is alerted: migration 0055 gives
+`search_query_performance_report` an 8-day cadence in `meta.sync_freshness`,
+so the daily-sync "Verify sync freshness" step goes red if a week passes
+with no successful SQP run.
+
+The publish lag is Amazon-side: a WEEK report lands a few days after the
+week closes, a MONTH report a few days into the next month. The schedule
+pulls each as soon as it is available; it cannot make "today" appear sooner
+than Amazon publishes it.
+
 ## Quarterly aggregates
 
 Useful for high-level rollups; little reason to backfill since MONTH
@@ -172,9 +197,10 @@ ORDER BY t.search_query, year, month;
 - **One period per call.** No spanning. Listing every Tuesday in
   October's monthly report = 1 call covering Oct 1–31; you can't merge
   with September.
-- **Daily-sync isn't wired yet.** This CLI is operator-run. Adding a
-  weekly cron (every Sunday for the previous Sun-Sat week) is a Phase 7
-  follow-up.
+- **Automated on a schedule.** `.github/workflows/sqp-sync.yml` pulls WEEK
+  (Wednesdays) and MONTH (the 8th) per region; see "Automated sync" above.
+  Hand-run backfills are still the tool for history (deeper WEEK windows,
+  the 17-month MONTH load) and for one-off ASIN scoping.
 - **Forward-looking:** as the lake fills going forward via daily / weekly
   sync, the 17-month ceiling becomes less of a problem — the daily-sync
   history will eventually exceed Amazon's retention.
