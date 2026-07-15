@@ -85,12 +85,21 @@ jobs:
       - name: Check region credentials
         id: creds
         env:
+          # EU is this account's primary region, so its token lives in the
+          # legacy unprefixed SP_API_REFRESH_TOKEN (with SP_API_REGION=eu),
+          # exactly as daily-sync.yml resolves it. SP_API_EU_REFRESH_TOKEN is
+          # honoured too if an account stores EU as a prefixed second region.
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
           SP_API_EU_REFRESH_TOKEN: ${{ secrets.SP_API_EU_REFRESH_TOKEN }}
           SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
         run: |
-          if [ "${{ matrix.region }}" = "eu" ]; then TOK="$SP_API_EU_REFRESH_TOKEN"; else TOK="$SP_API_NA_REFRESH_TOKEN"; fi
+          if [ "${{ matrix.region }}" = "eu" ]; then
+            TOK="${SP_API_EU_REFRESH_TOKEN:-$SP_API_REFRESH_TOKEN}"
+          else
+            TOK="$SP_API_NA_REFRESH_TOKEN"
+          fi
           if [ -z "$TOK" ]; then
-            echo "::notice::No SP_API_${{ matrix.region }} refresh token configured — skipping the ${{ matrix.region }} leg."
+            echo "::notice::No refresh token configured for ${{ matrix.region }} — skipping this leg."
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -109,6 +118,13 @@ jobs:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
           SP_API_LWA_CLIENT_ID: ${{ secrets.SP_API_LWA_CLIENT_ID }}
           SP_API_LWA_CLIENT_SECRET: ${{ secrets.SP_API_LWA_CLIENT_SECRET }}
+          # Primary region (EU/UK) via the legacy unprefixed vars, plus the
+          # prefixed forms for both regions. getSpApiRegionConfig(--region)
+          # picks the right token: eu -> SP_API_EU_REFRESH_TOKEN or (primary)
+          # SP_API_REFRESH_TOKEN; na -> SP_API_NA_REFRESH_TOKEN.
+          SP_API_REFRESH_TOKEN: ${{ secrets.SP_API_REFRESH_TOKEN }}
+          SP_API_REGION: ${{ secrets.SP_API_REGION }}
+          SP_API_MARKETPLACE_IDS: ${{ secrets.SP_API_MARKETPLACE_IDS }}
           SP_API_EU_REFRESH_TOKEN: ${{ secrets.SP_API_EU_REFRESH_TOKEN }}
           SP_API_EU_MARKETPLACE_IDS: ${{ secrets.SP_API_EU_MARKETPLACE_IDS }}
           SP_API_NA_REFRESH_TOKEN: ${{ secrets.SP_API_NA_REFRESH_TOKEN }}
