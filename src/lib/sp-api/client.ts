@@ -27,6 +27,18 @@ const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout
 /** Hard cap on a single 429 wait — one stuck request shouldn't hang for minutes. */
 const MAX_THROTTLE_WAIT_MS = 120_000;
 
+/**
+ * createReport (POST /reports/2021-06-30/reports) is throttled to 1 call / 15 min
+ * APP-WIDE for GET_SALES_AND_TRAFFIC_REPORT (Amazon-confirmed 2026-05-26). The
+ * x-amzn-RateLimit-Limit header only advertises the generic ~0.0167 req/s burst
+ * bucket, which yields a 60s wait — far too short to clear the real 15-min window.
+ * Waiting 60s × 5 retries (~6 min) can't outlast one lost quota window, so a single
+ * contended window used to kill an entire multi-hour backfill. For createReport
+ * 429s we instead wait a full window + slack so the next attempt actually succeeds.
+ */
+const REPORT_CREATE_PATH = '/reports/2021-06-30/reports';
+const REPORT_CREATE_THROTTLE_WAIT_MS = 16 * 60_000; // 16 min: one 15-min window + slack
+
 export class SpApiError extends Error {
   constructor(
     public readonly status: number,
@@ -67,8 +79,14 @@ export class SpApiClient {
           // refill; pRetry's exponential backoff (~31s total) is far too
           // short to clear it. When a 429 carries a rate-limit signal, wait
           // that long here — pRetry's own backoff and next attempt follow.
+          // createReport's true quota (1/15 min) is under-reported by the
+          // rate-limit header, so for that path wait a full window instead of
+          // the header's 60s (see REPORT_CREATE_THROTTLE_WAIT_MS).
           if (err instanceof SpApiError && err.status === 429 && err.retryAfterMs) {
-            const waitMs = Math.min(err.retryAfterMs, MAX_THROTTLE_WAIT_MS);
+            const isCreateReport = req.method === 'POST' && req.path === REPORT_CREATE_PATH;
+            const waitMs = isCreateReport
+              ? REPORT_CREATE_THROTTLE_WAIT_MS
+              : Math.min(err.retryAfterMs, MAX_THROTTLE_WAIT_MS);
             console.error(`  SP-API 429 throttled — waiting ${Math.round(waitMs / 1000)}s for quota before retry`);
             await sleep(waitMs);
           }
