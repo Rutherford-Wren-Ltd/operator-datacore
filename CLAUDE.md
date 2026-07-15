@@ -126,7 +126,7 @@ Common failure modes and what to say:
 |---|---|---|
 | `relation "brain.sales_traffic_daily" does not exist` | Migrations didn't run | `npm run migrate`; check `meta.migration_history` |
 | `403 Forbidden` from SP-API | Refresh token expired or wrong region | Regenerate refresh token in Seller Central → Apps and Services → Develop apps |
-| `429 Too Many Requests` from SP-API | Rate limit hit during backfill | Reduce concurrency; backfill paginates and retries automatically, just wait |
+| `429 Too Many Requests` from SP-API | Rate limit hit during backfill | Backfill retries automatically, just wait. Sales & Traffic `createReport` is capped at 1 call / 15 min app-wide, so the client waits a full 15-minute window on those 429s (`REPORT_CREATE_THROTTLE_WAIT_MS` in `src/lib/sp-api/client.ts`) — a single throttle no longer fails the run. Persistent 429s across many calls usually mean a competing S&T caller (daily-sync or another run) is sharing the quota. |
 | Numbers don't match Seller Central | Probably timezone | Confirm `ROLLUP_TIMEZONE=America/Los_Angeles` (Amazon's accounting TZ for US) |
 | First backfill returns 0 rows | Sales & Traffic report not enrolled | Seller Central → Brand Analytics → enrol (free, instant for brand-registered sellers) |
 
