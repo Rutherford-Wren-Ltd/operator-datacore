@@ -21,6 +21,8 @@
 -- view (0052), which selects FROM this view, keeps working unchanged.
 -- ============================================================================
 
+BEGIN;
+
 CREATE OR REPLACE VIEW meta.sync_freshness AS
 WITH per_object AS (
   SELECT
@@ -74,3 +76,9 @@ ORDER BY object, source;
 
 COMMENT ON VIEW meta.sync_freshness IS
   'Dead-man''s-switch view: one row per (object, source) showing latest activity + a per-object cadence expectation. The verify-sync-freshness CLI fails CI when any object''s hours_since_last_success exceeds expected_max_hours_since_success. Per-object cadences are intentionally inline in the CASE so a new ingest object explicitly opts in to alerting — silent is better than false-positive. search_query_performance_report opted in at 8d (weekly) in migration 0055 once sqp-sync.yml began pulling on a schedule.';
+
+INSERT INTO meta.migration_history (filename)
+VALUES ('0055_sqp_freshness_cadence.sql')
+ON CONFLICT (filename) DO NOTHING;
+
+COMMIT;
