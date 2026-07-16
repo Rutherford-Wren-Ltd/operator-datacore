@@ -150,10 +150,19 @@ jobs:
           fi
           [ -z "$TOPN" ] && TOPN="75"
 
-          echo "Pulling SQP: grain=$PT window=$CNT region=${{ matrix.region }} top_n=$TOPN (skip-existing)"
+          # Pin each region to a single marketplace. SP_API_MARKETPLACE_IDS
+          # holds the whole EU set (UK, DE, FR, IT, ES, ...), so without this
+          # the eu leg fans out across every EU marketplace and the worklist
+          # (periods x marketplaces x ASINs) explodes past the job timeout
+          # before it ever reaches UK's newest period. UK and US are the
+          # marketplaces we report on; extend here if that changes.
+          if [ "${{ matrix.region }}" = "eu" ]; then MKT="UK"; else MKT="US"; fi
+
+          echo "Pulling SQP: grain=$PT window=$CNT region=${{ matrix.region }} marketplace=$MKT top_n=$TOPN (skip-existing)"
           npm run backfill-search-query -- \
             --period-type "$PT" \
             "$COUNT_FLAG" "$CNT" \
             --region "${{ matrix.region }}" \
+            --marketplaces "$MKT" \
             --top-n "$TOPN" \
             --skip-existing
