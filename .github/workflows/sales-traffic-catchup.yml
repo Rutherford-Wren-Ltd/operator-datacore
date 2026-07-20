@@ -31,9 +31,9 @@ on:
         type: string
         required: true
       marketplaces:
-        description: 'Comma-separated short-codes or IDs (default: DE)'
+        description: 'Comma-separated short-codes or IDs (default: DE,FR)'
         type: string
-        default: 'DE'
+        default: 'DE,FR'
   # Unattended: two runs/day in quiet windows that miss the 15:00-UTC daily-sync
   # and the Sun-03:00-UTC restatement. A 350-min job finishes (~07:00→12:50 /
   # 20:00→01:50) long before the next fire, so runs never overlap each other or
@@ -84,17 +84,20 @@ jobs:
           FROM="${{ github.event.inputs.from }}"
           TO="${{ github.event.inputs.to }}"
           MKT="${{ github.event.inputs.marketplaces }}"
-          # Schedule-triggered runs carry no inputs — fall back to a DYNAMIC,
-          # FOCUSED window: DE only, last 12 months. Rationale: S&T is 1 report
-          # per (marketplace, day) at 1 createReport / 15 min, so the full 2yr ×
-          # 4 markets is an ~8-week grind. DE is the priority market and the last
-          # 12 months is the high-value window, so we finish that (~3 days) first;
-          # widen to FR/IT/ES or 23 months later via workflow_dispatch inputs.
-          # FROM stays within Amazon's ~24-month retention; TO=yesterday. The
-          # no-data marker skips any stray empty days so runs never re-loop.
-          if [ -z "$FROM" ]; then FROM="$(date -u -d '12 months ago' +%F)"; fi
+          # Schedule-triggered runs carry no inputs — fall back to a DYNAMIC
+          # window: DE + FR, back to Amazon's retention edge (~25 months), to
+          # bring both to 24-month parity with UK/US. DE's last 12 months are
+          # already landed, so --skip-existing means the scheduled runs now
+          # advance DE's older ~12 months and FR's full history. S&T is 1 report
+          # per (marketplace, day) at 1 createReport / 15 min, so DE+FR to 24
+          # months is a multi-week grind at 2 runs/day; the no-data marker skips
+          # days before data existed so runs never re-loop. IT/ES stay excluded
+          # (materiality call); add them via workflow_dispatch if needed.
+          # REMOVE THIS SCHEDULE once DE+FR are fully landed (see PR — mirrors
+          # the DE-first wind-down in #123).
+          if [ -z "$FROM" ]; then FROM="$(date -u -d '25 months ago' +%F)"; fi
           if [ -z "$TO" ]; then TO="$(date -u -d 'yesterday' +%F)"; fi
-          if [ -z "$MKT" ]; then MKT="DE"; fi
+          if [ -z "$MKT" ]; then MKT="DE,FR"; fi
           echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing; resumes each run)"
           npm run backfill -- --source amazon --report sales-traffic \
             --region eu --marketplaces "$MKT" --from "$FROM" --to "$TO" --skip-existing

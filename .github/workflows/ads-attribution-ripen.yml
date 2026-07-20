@@ -81,7 +81,7 @@ jobs:
           # daily-sync because the daily setup uses --concurrency 2 (2
           # profiles × 2 products = 4 concurrent); adding SB there would
           # push it to 8 and trip the ceiling.
-          npm run ads-ingest -- --products SP,SD,SB --days "$DAYS"
+          npm run ads-ingest -- --products SP,SD,SB --days "$DAYS" --pace-ms 20000
 
   ripen-na:
     name: Ripen NA Ads (last N days)
@@ -109,4 +109,4 @@ jobs:
           DAYS="${{ github.event.inputs.days || '7' }}"
           echo "Re-pulling last ${DAYS} days of NA Ads data (SP + SD + SB)"
           # SB added 2026-06-03 (PRs #67 + #68). Same logic as EU above.
-          npm run ads-ingest -- --region NA --products SP,SD,SB --days "$DAYS"
+          npm run ads-ingest -- --region NA --products SP,SD,SB --days "$DAYS" --pace-ms 20000

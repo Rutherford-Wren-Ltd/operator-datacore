@@ -88,10 +88,12 @@ async function main(): Promise<void> {
       products: { type: 'string' },
       region: { type: 'string' },
       concurrency: { type: 'string' },
+      'pace-ms': { type: 'string' },
       'skip-existing': { type: 'boolean', default: false },
     },
   });
   const skipExisting = values['skip-existing'] ?? false;
+  const paceMs = resolvePaceMs(values['pace-ms']);
 
   const env = loadEnvForAdsShared();
   const region: AdsApiRegion = (values.region as AdsApiRegion | undefined) ?? env.ADS_API_REGION;
@@ -117,6 +119,7 @@ async function main(): Promise<void> {
   console.log(`  Products:      ${products.join(', ')}`);
   console.log(`  Dates:         ${dates[0]}${dates.length > 1 ? ` … ${dates[dates.length - 1]} (${dates.length} day${dates.length === 1 ? '' : 's'})` : ''}`);
   console.log(`  Concurrency:   ${concurrency} profile${concurrency === 1 ? '' : 's'} in parallel per date`);
+  console.log(`  Pace:          ${paceMs}ms between dates`);
   console.log(`  Skip existing: ${skipExisting}`);
   console.log('');
 
@@ -208,7 +211,7 @@ async function main(): Promise<void> {
     // so one profile's failure doesn't take down the rest of the batch.
     // A failure summary is printed at end and exit code reflects whether
     // any profile-dates failed.
-    for (const date of dates) {
+    for (const [dateIdx, date] of dates.entries()) {
       const profilesToRun = matchedProfiles.filter(
         (p) => !completedPairs.has(`${p.profileId}|${date}`),
       );
@@ -262,6 +265,13 @@ async function main(): Promise<void> {
         }
       }
       console.log('');
+
+      // Space consecutive dates apart to stay under Amazon's sustained
+      // report-generation limit (see resolvePaceMs). No pause after the last
+      // date, and none when paceMs is 0 (the daily-sync default).
+      if (paceMs > 0 && dateIdx < dates.length - 1) {
+        await sleep(paceMs);
+      }
     }
 
     const durationSec = ((Date.now() - startedAt) / 1000).toFixed(1);
@@ -539,6 +549,27 @@ function resolveConcurrency(value: string | undefined): number {
   }
   return n;
 }
+
+/**
+ * Resolve --pace-ms: milliseconds to wait between consecutive dates in the
+ * worklist. Default 0 (no pause — unchanged behaviour for daily-sync, which
+ * only ever pulls a day or two). The multi-date ripen re-pull fires
+ * SP+SD+SB report POSTs per date; without spacing, a 7-day run bursts ~21
+ * report creations and trips Amazon's SUSTAINED report-generation limit
+ * (the per-request 429 retry recovers a single spike, not an exhausted
+ * window). Pacing dates apart keeps the run under the sustained ceiling.
+ */
+function resolvePaceMs(value: string | undefined): number {
+  if (!value) return 0;
+  const n = parseInt(value, 10);
+  if (Number.isNaN(n) || n < 0) {
+    throw new Error(`--pace-ms must be a non-negative integer. Got "${value}".`);
+  }
+  return n;
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
 main().catch((err) => {
   console.error(err);
