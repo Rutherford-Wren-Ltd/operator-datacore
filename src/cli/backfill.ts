@@ -41,6 +41,7 @@ interface ParsedArgs {
   marketplaceFilter: string[] | null;
   skipExisting: boolean;
   retryCancelled: boolean;
+  newestFirst: boolean;
 }
 
 function parseCliArgs(): ParsedArgs {
@@ -63,6 +64,10 @@ function parseCliArgs(): ParsedArgs {
       // meta.report_fatal_marker instead of skipping them (e.g. to recheck a
       // day whose data may have since landed). Off by default.
       'retry-cancelled': { type: 'boolean', default: false },
+      // Process the day worklist newest-first (recent months before deep
+      // history). Matters under the 1-report/15-min throttle: forecasting
+      // reads the recent window, so land it first. Off by default.
+      'newest-first': { type: 'boolean', default: false },
     },
   });
 
@@ -91,6 +96,7 @@ function parseCliArgs(): ParsedArgs {
     marketplaceFilter: resolveMarketplaceFilter(values.marketplaces),
     skipExisting: values['skip-existing'] ?? false,
     retryCancelled: values['retry-cancelled'] ?? false,
+    newestFirst: values['newest-first'] ?? false,
   };
 }
 
@@ -192,6 +198,7 @@ async function main(): Promise<void> {
   console.log(`  Concurrency:   ${args.concurrency}  (clamped to 1 for sales-traffic)`);
   console.log(`  Delay:         ${args.delayMs}ms  (clamped to >= 900000 for sales-traffic)`);
   console.log(`  Skip existing: ${args.skipExisting}`);
+  console.log(`  Order:         ${args.newestFirst ? 'newest-first' : 'oldest-first'}`);
   console.log('');
 
   const spClient = new SpApiClient({
@@ -248,6 +255,7 @@ async function main(): Promise<void> {
       toDate,
       concurrency: args.concurrency,
       delayMs: args.delayMs,
+      newestFirst: args.newestFirst,
       ...(existingKeys ? { existingKeys } : {}),
       onProgress: (info) => {
         const pct = ((info.done / info.total) * 100).toFixed(1).padStart(5);

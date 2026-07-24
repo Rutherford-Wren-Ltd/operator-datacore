@@ -98,6 +98,10 @@ jobs:
           if [ -z "$FROM" ]; then FROM="$(date -u -d '25 months ago' +%F)"; fi
           if [ -z "$TO" ]; then TO="$(date -u -d 'yesterday' +%F)"; fi
           if [ -z "$MKT" ]; then MKT="DE,FR"; fi
-          echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing; resumes each run)"
+          echo "S&T catch-up ${MKT}  ${FROM} -> ${TO}  (--skip-existing --newest-first; resumes each run)"
+          # --newest-first: land the recent months (what forecasting reads)
+          # before the deep history. DE's recent 12 months are already present,
+          # so --skip-existing skips them and the scarce quota flows to FR's
+          # recent window first, then trickles into the older history for both.
           npm run backfill -- --source amazon --report sales-traffic \
-            --region eu --marketplaces "$MKT" --from "$FROM" --to "$TO" --skip-existing
+            --region eu --marketplaces "$MKT" --from "$FROM" --to "$TO" --skip-existing --newest-first
