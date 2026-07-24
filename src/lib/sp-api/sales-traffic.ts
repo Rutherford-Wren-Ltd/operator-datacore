@@ -274,6 +274,28 @@ const SALES_TRAFFIC_MIN_DELAY_MS = 15 * 60 * 1000;
 const SALES_TRAFFIC_MAX_CONCURRENCY = 1;
 
 /**
+ * Expand an inclusive [from, to] window into one UTC-midnight Date per calendar
+ * day. `newestFirst` returns them latest-to-earliest; otherwise earliest-to-latest.
+ * Ordering is load-bearing under the 1-report/15-min throttle: the worklist is
+ * consumed in order, so newest-first lands the recent window (what forecasting
+ * reads) before the deep history.
+ */
+export function expandDayList(fromDate: Date, toDate: Date, newestFirst: boolean): Date[] {
+  const days: Date[] = [];
+  for (
+    let d = new Date(Date.UTC(fromDate.getUTCFullYear(), fromDate.getUTCMonth(), fromDate.getUTCDate()));
+    d.getTime() <= toDate.getTime();
+    d.setUTCDate(d.getUTCDate() + 1)
+  ) {
+    days.push(new Date(d));
+  }
+  if (newestFirst) {
+    days.reverse();
+  }
+  return days;
+}
+
+/**
  * Backfill Sales & Traffic for a window of days, across one or more marketplaces.
  *
  * Rate-limit handling is non-negotiable: concurrency is clamped to 1 and the
@@ -295,6 +317,15 @@ export async function backfillSalesTraffic(opts: {
   concurrency?: number;
   delayMs?: number;
   existingKeys?: Set<string>;
+  /**
+   * Process the day worklist newest-first instead of oldest-first. The Sales &
+   * Traffic report is throttled to 1 createReport / 15 min app-wide, so a long
+   * backfill spends its scarce quota in worklist order. Newest-first lands the
+   * recent months (the window forecasting reads) before the deep history,
+   * which is a lower priority. Default false (oldest-first) — unchanged for
+   * daily-sync and any caller that does not opt in.
+   */
+  newestFirst?: boolean;
   onProgress?: (info: {
     day: string;
     marketplace: string;
@@ -344,14 +375,7 @@ export async function backfillSalesTraffic(opts: {
     );
   }
 
-  const days: Date[] = [];
-  for (
-    let d = new Date(Date.UTC(opts.fromDate.getUTCFullYear(), opts.fromDate.getUTCMonth(), opts.fromDate.getUTCDate()));
-    d.getTime() <= opts.toDate.getTime();
-    d.setUTCDate(d.getUTCDate() + 1)
-  ) {
-    days.push(new Date(d));
-  }
+  const days = expandDayList(opts.fromDate, opts.toDate, opts.newestFirst ?? false);
 
   const allTasks: Array<{ day: Date; marketplaceId: string }> = [];
   for (const day of days) {
